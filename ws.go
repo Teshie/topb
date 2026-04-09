@@ -126,7 +126,7 @@ func queueAsyncWrite(fn func()) {
 }
 
 // Put near other globals
-const AdminNotifyChatID int64 = -4684393411 // admins group
+const AdminNotifyChatID int64 = -5233283759 // admins group
 
 // env: TELEGRAM_BOT_TOKEN must be set
 func sendTelegramMessage(chatID int64, text string) error {

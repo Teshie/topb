@@ -175,7 +175,7 @@ var (
 	HTTPTimeout = 30 * time.Second
 	UserAgent   = "Mozilla/5.0 (compatible; AddisBot/1.0; +https://example.com)"
 
-	NotifyChatID int64 = -1002877017597
+	NotifyChatID int64 = -5132012623
 
 	// Require credited party to be this exact person (tokenized match)
 	AllowedTelebirrReceiverName = getenvDefault("ALLOWED_RECEIVER_TELEBIRR", "Henok Belay Mendefro")
