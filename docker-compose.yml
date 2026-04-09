@@ -34,7 +34,7 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - BOT_TOKEN=${BOT_TOKEN}
       - BOTS_ENABLED=true
-      - BOTS_WS_BASE=wss://henb.teshie.dev
+      - BOTS_WS_BASE=wss://topb.tabia.site
       - BOTS_ROOMS=10,20,50
       - BOTS_PER_ROOM=30
       - BOTS_JOIN_JITTER_MS=1500
