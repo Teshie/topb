@@ -816,7 +816,7 @@ func (r *roomLive) finalizeClaims() {
 	// Admin notify (summary)
 	totalStr := fmt.Sprintf("%.2f Birr", float64(payoutCents)/100.0)
 	var b strings.Builder
-	fmt.Fprintf(&b, "🎉 *Dire Bingo* — Winners ✅ (split)\n\n*Stake:* %d Birr\n*Total Payout:* *%s*\n*Room:* `%s`\n\n",
+	fmt.Fprintf(&b, "🎉 *Top Bingo* — Winners ✅ (split)\n\n*Stake:* %d Birr\n*Total Payout:* *%s*\n*Room:* `%s`\n\n",
 		r.StakeAmount, totalStr, r.RoomID)
 	for _, w := range winners {
 		fmt.Fprintf(&b, "• [%s](tg://user?id=%d) — *%.2f Birr* (Board `%d`)\n",
@@ -831,7 +831,7 @@ func (r *roomLive) finalizeClaims() {
 		if isBotUser(w.TID) {
 			continue
 		}
-		msg := fmt.Sprintf("🎉 *Congratulations %s!*\nYou won: *%.2f Birr*\nRoom: `%s`\nBoard: %d\nMatched: `%v`\n\nDire Bingo",
+		msg := fmt.Sprintf("🎉 *Congratulations %s!*\nYou won: *%.2f Birr*\nRoom: `%s`\nBoard: %d\nMatched: `%v`\n\nTop Bingo",
 			w.FirstName, float64(w.Amount)/100.0, r.RoomID, w.Board, w.Matched)
 		go func(tid int64, txt string) {
 			if err := sendTelegramMessage(tid, txt); err != nil {
@@ -1577,7 +1577,7 @@ func (r *roomLive) endRoundWithWinner(winnerTID int64, winnerBoard int, matched 
 	// 1) Winner-only WebSocket message
 	winnerOnly := map[string]any{
 		"type":                "winner_congrats",
-		"message":             fmt.Sprintf("🎉 Congratulations %s!\nYou won: %s\nDire Bingo", winnerFirstName, amtStr),
+		"message":             fmt.Sprintf("🎉 Congratulations %s!\nYou won: %s\nTop Bingo", winnerFirstName, amtStr),
 		"win_amount":          winBirr,
 		"win_amount_str":      amtStr,
 		"winner_board_number": winnerBoard,
@@ -1591,7 +1591,7 @@ func (r *roomLive) endRoundWithWinner(winnerTID int64, winnerBoard int, matched 
 
 	// 2) Telegram: notify admins group
 	adminText := fmt.Sprintf(
-		"🎉 *Dire Bingo* — Winner ✅\n\n"+
+		"🎉 *Top Bingo* — Winner ✅\n\n"+
 			"*Stake:* %d Birr\n"+
 			"*Amount:* *%s*\n"+
 			"*Winner:* [%s](tg://user?id=%d)\n"+
@@ -1604,7 +1604,7 @@ func (r *roomLive) endRoundWithWinner(winnerTID int64, winnerBoard int, matched 
 
 	// 3) Telegram: DM the winner
 	userText := fmt.Sprintf(
-		"🎉 *Congratulations %s!*\nYou won: *%s*\nRoom: `%s`\nBoard: %d\nMatched: `%s`\n\nDire Bingo",
+		"🎉 *Congratulations %s!*\nYou won: *%s*\nRoom: `%s`\nBoard: %d\nMatched: `%s`\n\nTop Bingo",
 		winnerFirstName, amtStr, r.RoomID, winnerBoard, matchStr,
 	)
 	if err := sendTelegramMessage(winnerTID, userText); err != nil {
