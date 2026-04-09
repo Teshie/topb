@@ -1,0 +1,25 @@
+{
+    "ws_base": "wss://henb.teshie.dev",
+    "rooms": [
+        {
+            "id": "10",
+            "stake": 10,
+            "bots": 150
+        },
+        {
+            "id": "20",
+            "stake": 20,
+            "bots": 150
+        },
+        {
+            "id": "50",
+            "stake": 50,
+            "bots": 120
+        },
+        {
+            "id": "100",
+            "stake": 100,
+            "bots": 6
+        }
+    ]
+}

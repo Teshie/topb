@@ -1,0 +1,10 @@
+# backend/Caddyfile
+henb.teshie.dev {
+    encode zstd gzip
+    reverse_proxy go-app:8001
+}
+
+henf.teshie.dev {
+    encode zstd gzip
+    reverse_proxy aradabingo-web-1:3000
+}

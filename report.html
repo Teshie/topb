@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nov 22 Transactions</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            background: #f5f5f5;
+            color: #333;
+            padding: 8px;
+        }
+
+        .container {
+            max-width: 100%;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 12px;
+            padding: 10px;
+        }
+
+        h1 {
+            font-size: 1.4rem;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+
+        .date-badge {
+            display: inline-block;
+            background: #3498db;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .cards-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 10px;
+            height: fit-content;
+        }
+
+        .card-header {
+            padding-bottom: 6px;
+            margin-bottom: 6px;
+            border-bottom: 1px solid #eee;
+            text-align: center;
+        }
+
+        .card-title {
+            font-size: 0.85rem;
+            color: #2c3e50;
+            font-weight: 600;
+        }
+
+        .transaction-list {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 4px;
+        }
+
+        .transaction-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 3px;
+            border-bottom: 1px solid #f5f5f5;
+        }
+
+        .transaction-item:last-child {
+            border-bottom: none;
+        }
+
+        .transaction-info {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex: 1;
+        }
+
+        .transaction-icon {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 0.6rem;
+            flex-shrink: 0;
+        }
+
+        .transaction-icon.deposit {
+            background: #27ae60;
+        }
+
+        .transaction-icon.stake {
+            background: #e74c3c;
+        }
+
+        .transaction-details {
+            flex: 1;
+        }
+
+        .transaction-details h4 {
+            font-size: 0.75rem;
+            margin-bottom: 1px;
+            color: #2c3e50;
+        }
+
+        .transaction-amount {
+            text-align: right;
+            min-width: 70px; /* Increased to accommodate seconds */
+        }
+
+        .transaction-amount .amount {
+            font-size: 0.75rem;
+            font-weight: bold;
+            margin-bottom: 1px;
+        }
+
+        .transaction-amount .time {
+            font-size: 0.6rem;
+            color: #95a5a6;
+        }
+
+        .deposit-amount {
+            color: #27ae60;
+        }
+
+        .stake-amount {
+            color: #e74c3c;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 1px 4px;
+            border-radius: 6px;
+            font-size: 0.55rem;
+            font-weight: bold;
+        }
+
+        .status.success {
+            background: #d5f4e6;
+            color: #27ae60;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 30px 15px;
+            color: #7f8c8d;
+            grid-column: 1 / -1;
+        }
+
+        .loading i {
+            font-size: 1.5rem;
+            margin-bottom: 8px;
+            color: #3498db;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 30px 15px;
+            color: #7f8c8d;
+            grid-column: 1 / -1;
+        }
+
+        .empty-state i {
+            font-size: 2rem;
+            margin-bottom: 8px;
+            color: #bdc3c7;
+        }
+
+        .summary {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #7f8c8d;
+            margin-top: 8px;
+            padding: 8px;
+            background: white;
+            border-radius: 6px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 6px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+
+        .page-btn {
+            padding: 3px 8px;
+            border: 1px solid #ddd;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.7rem;
+            transition: all 0.2s ease;
+        }
+
+        .page-btn.active {
+            background: #3498db;
+            color: white;
+            border-color: #3498db;
+        }
+
+        .page-btn:hover:not(.active) {
+            background: #f8f9fa;
+        }
+
+        .transaction-type {
+            font-size: 0.65rem;
+            color: #7f8c8d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Transaction History</h1>
+            <div class="date-badge">Nov 22, 2025</div>
+        </header>
+
+        <div class="cards-container" id="cards-container">
+            <div class="loading">
+                <i class="fas fa-spinner fa-spin"></i>
+                <p>Loading transactions...</p>
+            </div>
+        </div>
+
+        <div class="pagination" id="pagination"></div>
+
+        <div class="summary" id="summary"></div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const cardsContainer = document.getElementById('cards-container');
+            const pagination = document.getElementById('pagination');
+            const summary = document.getElementById('summary');
+            
+            const RECORDS_PER_CARD = 20;
+            let allTransactions = [];
+            let currentPage = 1;
+
+            // Fetch transactions from API
+            fetchTransactions();
+
+            async function fetchTransactions() {
+                try {
+                    const response = await fetch('https://henb.teshie.dev/transactions/6985718940');
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    let transactions = await response.json();
+                    
+                    // Filter for November 22, 2025 and exclude pending deposits
+                    const targetDate = '2025-12-18';
+                    allTransactions = transactions.filter(transaction => {
+                        const transactionDate = new Date(transaction.created_at).toISOString().split('T')[0];
+                        return transactionDate === targetDate && 
+                               !(transaction.type === 'deposit' && transaction.status === 'pending');
+                    });
+                    
+                    // Sort by date (newest first)
+                    allTransactions.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                    
+                    // Display cards and pagination
+                    displayCards();
+                    setupPagination();
+                    
+                } catch (error) {
+                    console.error('Error fetching transactions:', error);
+                    cardsContainer.innerHTML = `
+                        <div class="empty-state">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <p>Failed to load transactions</p>
+                        </div>
+                    `;
+                }
+            }
+
+            function displayCards() {
+                if (allTransactions.length === 0) {
+                    cardsContainer.innerHTML = `
+                        <div class="empty-state">
+                            <i class="fas fa-receipt"></i>
+                            <p>No transactions for November 22</p>
+                        </div>
+                    `;
+                    summary.textContent = '';
+                    return;
+                }
+
+                const startIndex = (currentPage - 1) * 2; // Show 2 cards per page
+                const cardsToShow = Math.min(2, Math.ceil(allTransactions.length / RECORDS_PER_CARD) - startIndex);
+
+                let html = '';
+                
+                for (let i = 0; i < cardsToShow; i++) {
+                    const cardIndex = startIndex + i;
+                    const startRecord = cardIndex * RECORDS_PER_CARD;
+                    const endRecord = startRecord + RECORDS_PER_CARD;
+                    const cardTransactions = allTransactions.slice(startRecord, endRecord);
+                    
+                    html += `
+                        <div class="card">
+                            <div class="card-header">
+                                <div class="card-title">Records ${startRecord + 1}-${Math.min(endRecord, allTransactions.length)}</div>
+                            </div>
+                            <div class="transaction-list">
+                                ${generateTransactionHTML(cardTransactions)}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                cardsContainer.innerHTML = html;
+                
+                // Update summary
+                const totalPages = Math.ceil(Math.ceil(allTransactions.length / RECORDS_PER_CARD) / 2);
+                const shownRecordsStart = startIndex * RECORDS_PER_CARD + 1;
+                const shownRecordsEnd = Math.min((startIndex + cardsToShow) * RECORDS_PER_CARD, allTransactions.length);
+                summary.textContent = `Showing ${shownRecordsStart}-${shownRecordsEnd} of ${allTransactions.length} transactions (Page ${currentPage} of ${totalPages})`;
+            }
+
+            function generateTransactionHTML(transactions) {
+                if (transactions.length === 0) {
+                    return '<div class="empty-state" style="padding:15px;"><i class="fas fa-inbox"></i><p>No records</p></div>';
+                }
+                
+                let html = '';
+                
+                transactions.forEach(transaction => {
+                    const isDeposit = transaction.type === 'deposit';
+                    const isStake = transaction.type === 'stake';
+                    const amountClass = isDeposit ? 'deposit-amount' : 'stake-amount';
+                    const iconClass = isDeposit ? 'deposit' : 'stake';
+                    const icon = isDeposit ? 'fas fa-plus' : 'fas fa-minus';
+                    const amount = parseFloat(transaction.total).toFixed(2);
+                    
+                    // Format time with hours, minutes, AND seconds
+                    const date = new Date(transaction.created_at);
+                    const formattedTime = date.toLocaleTimeString('en-US', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: true
+                    });
+                    
+                    html += `
+                        <div class="transaction-item">
+                            <div class="transaction-info">
+                                <div class="transaction-icon ${iconClass}">
+                                    <i class="${icon}"></i>
+                                </div>
+                                <div class="transaction-details">
+                                    <h4>${isDeposit ? 'Deposit' : 'Stake'}</h4>
+                                    <span class="status ${transaction.status}">${transaction.status}</span>
+                                </div>
+                            </div>
+                            <div class="transaction-amount">
+                                <div class="amount ${amountClass}">${isDeposit ? '+' : '-'} ${amount}</div>
+                                <div class="time">${formattedTime}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                return html;
+            }
+
+            function setupPagination() {
+                const totalCards = Math.ceil(allTransactions.length / RECORDS_PER_CARD);
+                const totalPages = Math.ceil(totalCards / 2);
+                
+                if (totalPages <= 1) {
+                    pagination.innerHTML = '';
+                    return;
+                }
+                
+                let html = '';
+                
+                // Previous button
+                html += `<button class="page-btn" onclick="changePage(${currentPage - 1})" ${currentPage === 1 ? 'disabled' : ''}>
+                    <i class="fas fa-chevron-left"></i>
+                </button>`;
+                
+                // Page buttons
+                const maxVisiblePages = 5;
+                let startPage = Math.max(1, currentPage - Math.floor(maxVisiblePages / 2));
+                let endPage = Math.min(totalPages, startPage + maxVisiblePages - 1);
+                
+                if (endPage - startPage + 1 < maxVisiblePages) {
+                    startPage = Math.max(1, endPage - maxVisiblePages + 1);
+                }
+                
+                for (let i = startPage; i <= endPage; i++) {
+                    html += `<button class="page-btn ${i === currentPage ? 'active' : ''}" onclick="changePage(${i})">${i}</button>`;
+                }
+                
+                // Next button
+                html += `<button class="page-btn" onclick="changePage(${currentPage + 1})" ${currentPage === totalPages ? 'disabled' : ''}>
+                    <i class="fas fa-chevron-right"></i>
+                </button>`;
+                
+                pagination.innerHTML = html;
+            }
+
+            window.changePage = function(page) {
+                const totalCards = Math.ceil(allTransactions.length / RECORDS_PER_CARD);
+                const totalPages = Math.ceil(totalCards / 2);
+                
+                if (page >= 1 && page <= totalPages) {
+                    currentPage = page;
+                    displayCards();
+                    setupPagination();
+                }
+            };
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,2894 @@
+// ws.go
+// package hello
+
+// import (
+// 	"encoding/json"
+// 	"errors"
+// 	"fmt"
+// 	"log"
+// 	"math/rand"
+// 	"net/http"
+// 	"os"
+// 	"sort"
+// 	"strconv"
+// 	"strings"
+// 	"sync"
+// 	"time"
+
+// 	"github.com/gin-gonic/gin"
+// 	"github.com/golang-jwt/jwt/v5"
+// 	"github.com/gorilla/websocket"
+// 	"gorm.io/gorm"
+// 	"gorm.io/gorm/clause"
+// )
+
+// /* ============================================================
+//    Models / DTOs (package-wide so main.go sees them too)
+// ============================================================ */
+
+// type Room struct {
+// 	RoomID      string     `gorm:"primaryKey"`
+// 	StakeAmount int64      `gorm:"not null"`                  // birr
+// 	Status      string     `gorm:"type:varchar(32);not null"` // Ready|pending|about_to_start|playing|claimed
+// 	StartTime   *time.Time `gorm:""`                          // planned start
+// 	StartedAt   *time.Time `gorm:""`                          // actual start (new)
+// 	PossibleWin int64      `gorm:"not null;default:0"`        // cents (for lobby display; during play we expose frozen round payout)
+// 	CreatedAt   time.Time
+// 	UpdatedAt   time.Time
+// }
+
+// type RoomPlayer struct {
+// 	ID           uint      `gorm:"primaryKey"`
+// 	RoomID       string    `gorm:"index:uniq_room_tid,unique;not null"`
+// 	TelegramID   int64     `gorm:"index:uniq_room_tid,unique;not null"`
+// 	BoardNumber  *int      `gorm:""`
+// 	BoardNumber2 *int      `gorm:""` // NEW
+// 	JoinedAt     time.Time `gorm:"not null;autoCreateTime"`
+// 	CreatedAt    time.Time
+// 	UpdatedAt    time.Time
+// }
+// type PlayerInfo struct {
+// 	TelegramID   int64  `json:"telegram_id"`
+// 	FirstName    string `json:"first_name"`
+// 	Username     string `json:"username,omitempty"`
+// 	BoardNumber  *int   `json:"board_number,omitempty"`
+// 	BoardNumber2 *int   `json:"board_number_2,omitempty"` // NEW
+// 	HasPaid      bool   `json:"has_paid"`
+// }
+
+// type RoomStateDTO struct {
+// 	RoomID            string       `json:"room_id"`
+// 	StakeAmount       int64        `json:"stake_amount"`
+// 	Status            string       `json:"status"`
+// 	StartTime         *string      `json:"start_time"`
+// 	StartedAt         *string      `json:"started_at"`
+// 	PossibleWinCents  int64        `json:"possible_win_cents"`
+// 	NumberOfPlayers   int          `json:"number_of_players"`
+// 	SelectedBoardNums []int        `json:"selected_board_numbers"`
+// 	CalledNumbers     []int        `json:"called_numbers,omitempty"`
+// 	Players           []PlayerInfo `json:"players"`
+// }
+
+// /* ============================================================
+//    WS tuning (configurable buffers & timings)
+// ============================================================ */
+
+// var (
+// 	RoomWSSendBuf  = getenvInt("ROOM_WS_SEND_BUF", 256)  // per-room connection outbound queue size
+// 	LobbyWSSendBuf = getenvInt("LOBBY_WS_SEND_BUF", 128) // lobby outbound queue size
+
+// 	wsWriteWait = 10 * time.Second
+// 	wsPongWait  = 60 * time.Second
+// 	wsPingEvery = 20 * time.Second
+
+// 	// After a claim is accepted, keep room in "claimed" for a short time
+// 	claimedSettle = 5 * time.Second
+
+// 	// thresholds for starting a round (new)
+// 	minPlayersToStart        = getenvInt("MIN_PLAYERS_TO_START", 2)         // number of unique owners
+// 	minSelectedBoardsToStart = getenvInt("MIN_SELECTED_BOARDS_TO_START", 2) // boards reserved
+// )
+
+// // Put near other globals
+// const AdminNotifyChatID int64 = -4684393411 // admins group
+
+// // env: TELEGRAM_BOT_TOKEN must be set
+// func sendTelegramMessage(chatID int64, text string) error {
+// 	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+// 	if token == "" {
+// 		return fmt.Errorf("BOT_TOKEN not set")
+// 	}
+
+// 	type payload struct {
+// 		ChatID    int64  `json:"chat_id"`
+// 		Text      string `json:"text"`
+// 		ParseMode string `json:"parse_mode,omitempty"`
+// 	}
+// 	body, _ := json.Marshal(payload{
+// 		ChatID:    chatID,
+// 		Text:      text,
+// 		ParseMode: "Markdown",
+// 	})
+
+// 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+// 	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
+// 	req.Header.Set("Content-Type", "application/json")
+
+// 	resp, err := http.DefaultClient.Do(req)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer resp.Body.Close()
+// 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+// 		return fmt.Errorf("telegram sendMessage status=%d", resp.StatusCode)
+// 	}
+// 	return nil
+// }
+
+// var (
+// 	userBasicMu    sync.RWMutex
+// 	userBasicCache = make(map[int64]UserBasic)
+// )
+
+// func getenvInt(k string, def int) int {
+// 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+// 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+// 			return n
+// 		}
+// 	}
+// 	return def
+// }
+
+// /* ============================================================
+//    Boards (boards.json loader) — center "FREE" treated as 0
+// ============================================================ */
+
+// type Board [5][5]int
+
+// var allBoards []Board
+
+// func loadBoards() error {
+// 	raw, err := os.ReadFile("boards.json")
+// 	if err != nil {
+// 		return err
+// 	}
+// 	var tmp [][][]any
+// 	if err := json.Unmarshal(raw, &tmp); err != nil {
+// 		return err
+// 	}
+// 	allBoards = make([]Board, 0, len(tmp))
+// 	for _, grid := range tmp {
+// 		var b Board
+// 		for r := 0; r < 5 && r < len(grid); r++ {
+// 			row := grid[r]
+// 			for c := 0; c < 5 && c < len(row); c++ {
+// 				switch v := row[c].(type) {
+// 				case float64:
+// 					b[r][c] = int(v)
+// 				case string:
+// 					// "FREE" -> 0 sentinel
+// 					b[r][c] = 0
+// 				default:
+// 					b[r][c] = 0
+// 				}
+// 			}
+// 		}
+// 		allBoards = append(allBoards, b)
+// 	}
+// 	return nil
+// }
+
+// // 1-based board_number
+// func getBoard(boardNumber int) (Board, bool) {
+// 	if boardNumber <= 0 || boardNumber > len(allBoards) {
+// 		var z Board
+// 		return z, false
+// 	}
+// 	return allBoards[boardNumber-1], true
+// }
+
+// func init() {
+// 	if err := loadBoards(); err != nil {
+// 		log.Println("loadBoards error:", err)
+// 	}
+// }
+
+// /* ============================================================
+//    WebSocket upgrader
+// ============================================================ */
+
+// var upgrader = websocket.Upgrader{
+// 	CheckOrigin: func(r *http.Request) bool { return true }, // relax for dev
+// }
+
+// /* ============================================================
+//    In-memory room state
+// ============================================================ */
+
+// type roomLive struct {
+// 	RoomID      string
+// 	StakeAmount int64
+// 	Status      string
+// 	StartTime   *time.Time
+// 	StartedAt   *time.Time
+
+// 	PossibleWinCents int64
+// 	roundPayoutCents int64
+
+// 	players     map[int64]struct{}
+// 	selected    map[int]int64       // board -> tid (unchanged)
+// 	ownerBoards map[int64]twoBoards // NEW: per-user slots
+
+// 	// debited per user = number of paid slots (0..2)
+// 	debited map[int64]int // CHANGED: was map[int64]bool
+
+// 	conns        map[*roomConn]bool
+// 	called       []int
+// 	callSeq      []int
+// 	callIdx      int
+// 	calling      bool
+// 	callTicker   *time.Ticker
+// 	callStopCh   chan struct{}
+// 	callInterval time.Duration
+
+// 	mu                sync.Mutex
+// 	countdownRunning  bool
+// 	countdownCancelCh chan struct{}
+
+// 	claimOpen  bool
+// 	claimUntil time.Time
+// 	claimants  map[int64]claimant
+// 	claimTimer *time.Timer
+// 	CallLevel  int // 0 = normal, 1 = block human winning numbers
+
+// }
+// type twoBoards struct { // NEW
+// 	B1 *int // slot #1
+// 	B2 *int // slot #2
+// }
+
+// // Claim window length (milliseconds). Default 1500ms.
+// var claimWindow = func() time.Duration {
+// 	if v := strings.TrimSpace(os.Getenv("CLAIM_WINDOW_MS")); v != "" {
+// 		if n, err := strconv.Atoi(v); err == nil && n >= 200 && n <= 5000 {
+// 			return time.Duration(n) * time.Millisecond
+// 		}
+// 	}
+// 	return 1500 * time.Millisecond
+// }()
+
+// type claimant struct {
+// 	TID       int64
+// 	Board     int
+// 	Matched   []int
+// 	FirstName string
+// 	ClaimedAt time.Time
+// }
+
+// func newRoomLive(id string, stake int64) *roomLive {
+// 	return &roomLive{
+// 		RoomID:       id,
+// 		StakeAmount:  stake,
+// 		Status:       "Ready",
+// 		players:      make(map[int64]struct{}),
+// 		selected:     make(map[int]int64),
+// 		ownerBoards:  make(map[int64]twoBoards), // NEW
+// 		debited:      make(map[int64]int),       // CHANGED
+// 		conns:        make(map[*roomConn]bool),
+// 		called:       []int{},
+// 		callSeq:      nil,
+// 		callIdx:      0,
+// 		calling:      false,
+// 		callInterval: 6 * time.Second,
+// 		claimants:    make(map[int64]claimant),
+// 	}
+// }
+
+// func maxBoardNumber() int { return len(allBoards) }
+
+// // snapshot current conns without holding r.mu during writes
+// func (r *roomLive) snapshotConns() []*roomConn {
+// 	r.mu.Lock()
+// 	conns := make([]*roomConn, 0, len(r.conns))
+// 	for c := range r.conns {
+// 		conns = append(conns, c)
+// 	}
+// 	r.mu.Unlock()
+// 	return conns
+// }
+
+// func (r *roomLive) toDTO() RoomStateDTO {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+
+// 	selected := make([]int, 0, len(r.selected))
+// 	uniqOwners := make(map[int64]struct{})
+// 	for b, tid := range r.selected {
+// 		selected = append(selected, b)
+// 		uniqOwners[tid] = struct{}{}
+// 	}
+// 	sort.Ints(selected)
+
+// 	var startPlanned *string
+// 	if r.StartTime != nil {
+// 		s := r.StartTime.UTC().Format(time.RFC3339)
+// 		startPlanned = &s
+// 	}
+// 	var startedAtStr *string
+// 	if r.StartedAt != nil {
+// 		s := r.StartedAt.UTC().Format(time.RFC3339)
+// 		startedAtStr = &s
+// 	}
+
+// 	calledCopy := make([]int, len(r.called))
+// 	copy(calledCopy, r.called)
+
+// 	// Batch fetch for names
+// 	tids := make([]int64, 0, len(r.players))
+// 	for tid := range r.players {
+// 		tids = append(tids, tid)
+// 	}
+// 	userMap := fetchUsersBasic(tids)
+
+// 	players := make([]PlayerInfo, 0, len(r.players))
+// 	for tid := range r.players {
+// 		userBasic := userMap[tid]
+// 		if userBasic.FirstName == "" {
+// 			userBasic.FirstName = "Player"
+// 		}
+// 		tb := r.ownerBoards[tid]
+// 		var b1, b2 *int
+// 		if tb.B1 != nil {
+// 			v := *tb.B1
+// 			b1 = &v
+// 		}
+// 		if tb.B2 != nil {
+// 			v := *tb.B2
+// 			b2 = &v
+// 		}
+// 		players = append(players, PlayerInfo{
+// 			TelegramID:   tid,
+// 			FirstName:    userBasic.FirstName,
+// 			BoardNumber:  b1,
+// 			BoardNumber2: b2,
+// 			HasPaid:      r.debited[tid] > 0, // at least one slot paid
+// 		})
+// 	}
+
+// 	sort.Slice(players, func(i, j int) bool {
+// 		return players[i].TelegramID < players[j].TelegramID
+// 	})
+
+// 	// Use frozen payout when playing/claimed
+// 	pot := r.PossibleWinCents
+// 	if r.Status == "playing" || r.Status == "claimed" {
+// 		pot = r.roundPayoutCents
+// 	}
+
+// 	return RoomStateDTO{
+// 		RoomID:            r.RoomID,
+// 		StakeAmount:       r.StakeAmount,
+// 		Status:            r.Status,
+// 		StartTime:         startPlanned,
+// 		StartedAt:         startedAtStr,
+// 		PossibleWinCents:  pot,
+// 		NumberOfPlayers:   len(uniqOwners),
+// 		SelectedBoardNums: selected,
+// 		CalledNumbers:     calledCopy,
+// 		Players:           players,
+// 	}
+// }
+
+// type UserBasic struct {
+// 	FirstName string
+// }
+
+// func fetchUserBasic(tid int64) UserBasic {
+// 	var u User
+// 	_ = db.Where("telegram_id = ?", tid).First(&u).Error
+// 	return UserBasic{
+// 		FirstName: u.FirstName,
+// 	}
+// }
+// func callLevelForToday() int {
+// 	loc, _ := time.LoadLocation("Africa/Addis_Ababa")
+// 	now := time.Now().In(loc)
+
+// 	switch now.Weekday() {
+// 	case time.Monday, time.Wednesday, time.Saturday:
+// 		return 1
+// 	default:
+// 		return 0
+// 	}
+// }
+
+// // NEW: Batch fetch user info
+// // NEW: Batch fetch user info with caching
+// func fetchUsersBasic(tids []int64) map[int64]UserBasic {
+// 	out := make(map[int64]UserBasic, len(tids))
+// 	if len(tids) == 0 {
+// 		return out
+// 	}
+
+// 	// 1) Dedup tids
+// 	uniq := make([]int64, 0, len(tids))
+// 	seen := make(map[int64]struct{}, len(tids))
+// 	for _, tid := range tids {
+// 		if _, ok := seen[tid]; ok {
+// 			continue
+// 		}
+// 		seen[tid] = struct{}{}
+// 		uniq = append(uniq, tid)
+// 	}
+
+// 	// 2) Try cache first
+// 	missing := make([]int64, 0, len(uniq))
+// 	userBasicMu.RLock()
+// 	for _, tid := range uniq {
+// 		if ub, ok := userBasicCache[tid]; ok {
+// 			out[tid] = ub
+// 		} else {
+// 			missing = append(missing, tid)
+// 		}
+// 	}
+// 	userBasicMu.RUnlock()
+
+// 	if len(missing) == 0 {
+// 		return out
+// 	}
+
+// 	// 3) Fetch only missing tids from DB
+// 	var users []User
+// 	if err := db.Select("telegram_id, first_name").
+// 		Where("telegram_id IN ?", missing).
+// 		Find(&users).Error; err != nil {
+// 		// On error, just return what we have from cache
+// 		return out
+// 	}
+
+// 	// 4) Fill cache + output
+// 	userBasicMu.Lock()
+// 	defer userBasicMu.Unlock()
+// 	for _, u := range users {
+// 		ub := UserBasic{FirstName: u.FirstName}
+// 		userBasicCache[u.TelegramID] = ub
+// 		out[u.TelegramID] = ub
+// 	}
+
+// 	return out
+// }
+
+// func (r *roomLive) closeAllConns() {
+// 	conns := r.snapshotConns()
+// 	deadline := time.Now().Add(2 * time.Second)
+// 	for _, c := range conns {
+// 		_ = c.conn.WriteControl(websocket.CloseMessage, []byte("round_over"), deadline)
+// 		_ = c.conn.Close()
+// 	}
+// }
+
+// func (r *roomLive) registerConn(rc *roomConn) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	if r.conns == nil {
+// 		r.conns = make(map[*roomConn]bool)
+// 	}
+// 	r.conns[rc] = true
+// }
+
+// func (r *roomLive) unregisterConn(rc *roomConn) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	if r.conns != nil {
+// 		delete(r.conns, rc)
+// 	}
+// }
+
+// /* ---------- PossibleWin (80% of pot) helpers ---------- */
+
+// // expects r.mu held
+// //
+// //	func (r *roomLive) recomputePossibleWinLocked() {
+// //		uniq := make(map[int64]struct{})
+// //		for _, tid := range r.selected {
+// //			uniq[tid] = struct{}{}
+// //		}
+// //		participants := int64(len(uniq))
+// //		potBirr := participants * r.StakeAmount
+// //		payoutBirr := (potBirr * 80) / 100 // 80% to winners
+// //		r.PossibleWinCents = payoutBirr * 100
+// //	}
+// //
+// // expects r.mu held
+// func (r *roomLive) recomputePossibleWinLocked() {
+// 	paidSlots := int64(r.debitedCountLocked()) // CHANGED: count paid slots
+// 	potBirr := paidSlots * r.StakeAmount
+// 	payoutBirr := (potBirr * 80) / 100
+// 	r.PossibleWinCents = payoutBirr * 100
+// }
+
+// func (r *roomLive) recomputePossibleWin() {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	r.recomputePossibleWinLocked()
+// }
+
+// // which board belongs to tid?
+// func (r *roomLive) boardFor(tid int64) *int {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	tb := r.ownerBoards[tid]
+// 	if tb.B1 != nil {
+// 		v := *tb.B1
+// 		return &v
+// 	}
+// 	return nil
+// }
+
+// // NEW: both boards (ordered: slot #1 then slot #2 if present)
+// func (r *roomLive) boardsFor(tid int64) []int {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	tb := r.ownerBoards[tid]
+// 	out := []int{}
+// 	if tb.B1 != nil {
+// 		out = append(out, *tb.B1)
+// 	}
+// 	if tb.B2 != nil {
+// 		out = append(out, *tb.B2)
+// 	}
+// 	return out
+// }
+
+// // Count how many slots currently selected by user (expects lock held)
+// func (r *roomLive) countBoardsForOwnerLocked(tid int64) int {
+// 	tb := r.ownerBoards[tid]
+// 	n := 0
+// 	if tb.B1 != nil {
+// 		n++
+// 	}
+// 	if tb.B2 != nil {
+// 		n++
+// 	}
+// 	return n
+// }
+
+// // board selection / restore - WITH IMMEDIATE DEDUCTION
+// // setBoardFor charges exactly once per round and assigns exactly one board per user.
+// // Returns (ok, reason). ok=false with reason in {"board_taken","insufficient_balance","internal"}.
+// // Back-compat: treat legacy "setBoardFor" as assigning slot #1.
+// // Keeps old callers working without touching their code.
+// func (r *roomLive) setBoardFor(tid int64, board int) (bool, string) {
+// 	return r.setBoard1For(tid, board)
+// }
+
+// func (r *roomLive) clearBoardFor(tid int64) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+
+// 	// NO REFUNDS - user keeps the deduction even if they leave
+
+// 	for b, owner := range r.selected {
+// 		if owner == tid {
+// 			delete(r.selected, b)
+// 		}
+// 	}
+// 	r.recomputePossibleWinLocked()
+// }
+
+// func (r *roomLive) addPlayer(tid int64) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	r.players[tid] = struct{}{}
+// 	if r.Status == "Ready" {
+// 		r.Status = "pending"
+// 	}
+// }
+
+// func (r *roomLive) removePlayer(tid int64) {
+// 	r.mu.Lock()
+// 	// Remove both boards
+// 	tb := r.ownerBoards[tid]
+// 	if tb.B1 != nil {
+// 		delete(r.selected, *tb.B1)
+// 	}
+// 	if tb.B2 != nil {
+// 		delete(r.selected, *tb.B2)
+// 	}
+// 	delete(r.ownerBoards, tid)
+// 	r.recomputePossibleWinLocked()
+
+// 	delete(r.players, tid)
+// 	delete(r.debited, tid)
+
+// 	// If no players remain, full reset
+// 	if len(r.players) == 0 {
+// 		r.Status = "Ready"
+// 		r.StartTime = nil
+// 		r.StartedAt = nil
+// 		r.stopCountdownLocked()
+// 		r.stopCallingLocked()
+// 		r.selected = make(map[int]int64)
+// 		r.ownerBoards = make(map[int64]twoBoards)
+// 		r.debited = make(map[int64]int)
+// 		r.PossibleWinCents = 0
+// 		r.roundPayoutCents = 0
+// 		r.called = r.called[:0]
+// 		r.callSeq = nil
+// 		r.callIdx = 0
+// 		if r.claimTimer != nil {
+// 			r.claimTimer.Stop()
+// 			r.claimTimer = nil
+// 		}
+// 		r.claimOpen = false
+// 		r.claimUntil = time.Time{}
+// 		r.claimants = make(map[int64]claimant)
+// 		r.mu.Unlock()
+// 		return
+// 	}
+
+// 	// If countdown thresholds fail, revert
+// 	if r.Status == "about_to_start" && !r.eligibleToStartLocked() {
+// 		r.Status = "pending"
+// 		r.StartTime = nil
+// 		r.StartedAt = nil
+// 		r.stopCountdownLocked()
+// 	}
+// 	r.mu.Unlock()
+// }
+
+// /* ============================================================
+//    Start/Countdown helpers
+// ============================================================ */
+
+// // assumes r.mu held
+// func (r *roomLive) openClaimWindowLocked() {
+// 	if r.claimOpen {
+// 		return
+// 	}
+// 	r.claimOpen = true
+// 	r.claimUntil = time.Now().Add(claimWindow)
+// 	if r.claimTimer != nil {
+// 		r.claimTimer.Stop()
+// 	}
+// 	dur := time.Until(r.claimUntil)
+// 	if dur <= 0 {
+// 		dur = 100 * time.Millisecond
+// 	}
+// 	r.claimTimer = time.AfterFunc(dur, func() {
+// 		r.finalizeClaims()
+// 	})
+// }
+
+// // assumes r.mu held
+
+// // assumes r.mu held
+
+// // assumes r.mu held
+// func (r *roomLive) addClaimantLocked(tid int64, board int, matched []int, firstName string) {
+// 	// With two-board support, a user is eligible if they have paid at least once (>= 1 slot).
+// 	if r.debited[tid] <= 0 {
+// 		return
+// 	}
+
+// 	// Prevent duplicate entries from the same user within the window.
+// 	if _, exists := r.claimants[telToKey(tid)]; exists {
+// 		return
+// 	}
+
+// 	r.claimants[telToKey(tid)] = claimant{
+// 		TID:       tid,
+// 		Board:     board,                          // store the winning board for this claim
+// 		Matched:   append([]int(nil), matched...), // defensive copy
+// 		FirstName: firstName,
+// 		ClaimedAt: time.Now(),
+// 	}
+// }
+
+// // tiny helper to keep map keys consistent (int64 already fine)
+// func telToKey(t int64) int64 { return t }
+
+// // finalizeClaims closes the multi-claim window, splits the frozen payout equally,
+// // credits each valid claimant, notifies, broadcasts, and schedules reset.
+// func (r *roomLive) finalizeClaims() {
+// 	// capture state atomically
+// 	r.mu.Lock()
+// 	if r.Status != "playing" && r.Status != "claimed" {
+// 		r.mu.Unlock()
+// 		return
+// 	}
+// 	if !r.claimOpen {
+// 		r.mu.Unlock()
+// 		return
+// 	}
+// 	// close window
+// 	r.claimOpen = false
+// 	if r.claimTimer != nil {
+// 		r.claimTimer.Stop()
+// 		r.claimTimer = nil
+// 	}
+// 	// stop calling immediately, freeze already frozen payout
+// 	r.stopCallingLocked()
+// 	r.Status = "claimed"
+
+// 	// snapshot claimants (stable order: by ClaimedAt, then tid)
+// 	claimants := make([]claimant, 0, len(r.claimants))
+// 	for _, c := range r.claimants {
+// 		claimants = append(claimants, c)
+// 	}
+// 	sort.Slice(claimants, func(i, j int) bool {
+// 		if !claimants[i].ClaimedAt.Equal(claimants[j].ClaimedAt) {
+// 			return claimants[i].ClaimedAt.Before(claimants[j].ClaimedAt)
+// 		}
+// 		return claimants[i].TID < claimants[j].TID
+// 	})
+
+// 	// fallback: no valid claimants (should not happen if opened by TryClaim)
+// 	if len(claimants) == 0 {
+// 		r.mu.Unlock()
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 		time.AfterFunc(claimedSettle, func() {
+// 			r.resetForNextRoundLocked()
+// 			saveRoomStateToDB(r)
+// 			globalRoomsHub.broadcastRooms()
+// 			r.broadcastRoomStateToConns()
+// 		})
+// 		return
+// 	}
+
+// 	payoutCents := r.roundPayoutCents
+// 	if payoutCents < 0 {
+// 		payoutCents = 0
+// 	}
+// 	n := int64(len(claimants))
+// 	share := int64(0)
+// 	rem := int64(0)
+// 	if n > 0 {
+// 		share = payoutCents / n
+// 		rem = payoutCents % n
+// 	}
+
+// 	// distribute remainders (+1 cent) to earliest claimants to preserve total
+// 	credits := make(map[int64]int64, len(claimants))
+// 	for i, c := range claimants {
+// 		amt := share
+// 		if int64(i) < rem {
+// 			amt++ // 1-cent bump for the first 'rem' claimants
+// 		}
+// 		credits[c.TID] = amt
+// 	}
+// 	r.mu.Unlock()
+
+// 	// credit + notify
+// 	type winInfo struct {
+// 		TID       int64
+// 		Board     int
+// 		Amount    int64
+// 		Matched   []int
+// 		FirstName string
+// 	}
+// 	winners := make([]winInfo, 0, len(claimants))
+// 	for _, c := range claimants {
+// 		amt := credits[c.TID]
+// 		if amt <= 0 {
+// 			continue
+// 		}
+// 		if err := creditWinnerCents(c.TID, amt, r.RoomID); err != nil {
+// 			log.Printf("creditWinnerCents(tid=%d) failed: %v", c.TID, err)
+// 			continue
+// 		}
+// 		winners = append(winners, winInfo{
+// 			TID:       c.TID,
+// 			Board:     c.Board,
+// 			Amount:    amt,
+// 			Matched:   c.Matched,
+// 			FirstName: c.FirstName,
+// 		})
+// 	}
+
+// 	// Admin notify (summary)
+// 	totalStr := fmt.Sprintf("%.2f Birr", float64(payoutCents)/100.0)
+// 	var b strings.Builder
+// 	fmt.Fprintf(&b, "🎉 *Dire Bingo* — Winners ✅ (split)\n\n*Stake:* %d Birr\n*Total Payout:* *%s*\n*Room:* `%s`\n\n",
+// 		r.StakeAmount, totalStr, r.RoomID)
+// 	for _, w := range winners {
+// 		fmt.Fprintf(&b, "• [%s](tg://user?id=%d) — *%.2f Birr* (Board `%d`)\n",
+// 			w.FirstName, w.TID, float64(w.Amount)/100.0, w.Board)
+// 	}
+// 	if err := sendTelegramMessage(AdminNotifyChatID, b.String()); err != nil {
+// 		log.Println("telegram admin notify error:", err)
+// 	}
+
+// 	// DM each human winner (non-blocking, skip bots)
+// 	for _, w := range winners {
+// 		if isBotUser(w.TID) {
+// 			continue
+// 		}
+// 		msg := fmt.Sprintf("🎉 *Congratulations %s!*\nYou won: *%.2f Birr*\nRoom: `%s`\nBoard: %d\nMatched: `%v`\n\nDire Bingo",
+// 			w.FirstName, float64(w.Amount)/100.0, r.RoomID, w.Board, w.Matched)
+// 		go func(tid int64, txt string) {
+// 			if err := sendTelegramMessage(tid, txt); err != nil {
+// 				es := strings.ToLower(err.Error())
+// 				if strings.Contains(es, "telegram permanent 400") || strings.Contains(es, "telegram permanent 403") {
+// 					return
+// 				}
+// 				log.Printf("telegram user notify error (tid=%d): %v", tid, err)
+// 			}
+// 		}(w.TID, msg)
+// 	}
+
+// 	// Broadcast winners to room (array, with amounts)
+// 	winArr := make([]map[string]any, 0, len(winners))
+// 	for _, w := range winners {
+// 		winArr = append(winArr, map[string]any{
+// 			"is_self":             false,
+// 			"win_amount":          float64(w.Amount) / 100.0,
+// 			"winner_board_number": w.Board,
+// 			"matched_to":          w.Matched,
+// 			"user":                map[string]any{"first_name": w.FirstName},
+// 		})
+// 	}
+// 	msg := map[string]any{
+// 		"type":    "winners",
+// 		"winners": winArr,
+// 	}
+// 	for _, c := range r.snapshotConns() {
+// 		c.enqueueJSON(msg)
+// 	}
+
+// 	// Persist + lobby refresh + per-room snapshots
+// 	saveRoomStateToDB(r)
+// 	globalRoomsHub.broadcastRooms()
+// 	r.broadcastRoomStateToConns()
+
+// 	// settle then reset
+// 	time.AfterFunc(claimedSettle, func() {
+// 		r.resetForNextRoundLocked()
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 	})
+// }
+
+// // compute unique owners (from selected boards)
+// func (r *roomLive) uniqueOwnersCountLocked() int {
+// 	owners := make(map[int64]struct{})
+// 	for _, tid := range r.selected {
+// 		owners[tid] = struct{}{}
+// 	}
+// 	return len(owners)
+// }
+
+// // do we meet start thresholds?
+// func (r *roomLive) eligibleToStartLocked() bool {
+// 	owners := r.uniqueOwnersCountLocked()
+// 	if owners < minPlayersToStart {
+// 		return false
+// 	}
+// 	// at least N boards selected
+// 	if len(r.selected) < minSelectedBoardsToStart {
+// 		return false
+// 	}
+// 	return true
+// }
+// func (r *roomLive) numberCausesHumanWin(n int) bool {
+// 	called := append([]int(nil), r.called...)
+// 	called = append(called, n)
+
+// 	for boardNo, tid := range r.selected {
+// 		if isABotUser(tid) {
+// 			continue // we only care about humans
+// 		}
+
+// 		b, ok := getBoard(boardNo)
+// 		if !ok {
+// 			continue
+// 		}
+
+// 		won, _ := checkBingo(b, called)
+// 		if won {
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }
+
+// // INTERNAL: common core for assigning a board to a given slot
+// // 'slot' must be 1 or 2.
+// // Charges stake if that slot transitions from empty -> occupied.
+// func (r *roomLive) setBoardSlotFor(tid int64, board int, slot int) (bool, string) {
+// 	if slot != 1 && slot != 2 {
+// 		return false, "internal"
+// 	}
+
+// 	r.mu.Lock()
+// 	// Is the board already taken by someone else?
+// 	if owner, ok := r.selected[board]; ok && owner != tid {
+// 		r.mu.Unlock()
+// 		return false, "board_taken"
+// 	}
+
+// 	// Find current assigned board in this slot (if any)
+// 	tb := r.ownerBoards[tid]
+// 	var current *int
+// 	if slot == 1 {
+// 		current = tb.B1
+// 	} else {
+// 		current = tb.B2
+// 	}
+
+// 	// If this exact board already in this slot, nothing to do
+// 	if current != nil && *current == board {
+// 		r.mu.Unlock()
+// 		return true, ""
+// 	}
+
+// 	// Moving from some other board in this slot? We'll free the previous after we charge if needed.
+// 	var prev *int
+// 	if current != nil {
+// 		v := *current
+// 		prev = &v
+// 	}
+
+// 	// Determine if we need to charge for this slot
+// 	needDebit := false
+// 	if current == nil {
+// 		// slot was empty -> filling now => charge once
+// 		needDebit = true
+// 	}
+
+// 	stakeCents := r.StakeAmount * 100
+// 	r.mu.Unlock()
+
+// 	// Charge if needed (per-slot)
+// 	if needDebit {
+// 		if err := debitOneUserStake(tid, stakeCents, r.RoomID); err != nil {
+// 			if strings.Contains(strings.ToLower(err.Error()), "insufficient") {
+// 				return false, "insufficient_balance"
+// 			}
+// 			log.Printf("debit user %d failed: %v\n", tid, err)
+// 			return false, "internal"
+// 		}
+// 	}
+
+// 	// Commit under lock
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+
+// 	// If previously occupied this slot by a different board, free that board
+// 	if prev != nil && *prev != board {
+// 		delete(r.selected, *prev)
+// 	}
+
+// 	// Occupy the new board
+// 	r.selected[board] = tid
+// 	if slot == 1 {
+// 		tb.B1 = &board
+// 	} else {
+// 		tb.B2 = &board
+// 	}
+// 	r.ownerBoards[tid] = tb
+
+// 	// Track debit count
+// 	if needDebit {
+// 		r.debited[tid] = r.debited[tid] + 1
+// 	}
+
+// 	// Ensure player presence and recompute pot
+// 	if _, ok := r.players[tid]; !ok {
+// 		r.players[tid] = struct{}{}
+// 	}
+// 	r.recomputePossibleWinLocked()
+// 	return true, ""
+// }
+
+// // Clear slot #1 (no refunds)
+// func (r *roomLive) clearBoard1For(tid int64) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	tb := r.ownerBoards[tid]
+// 	if tb.B1 != nil {
+// 		delete(r.selected, *tb.B1)
+// 		tb.B1 = nil
+// 		r.ownerBoards[tid] = tb
+// 	}
+// 	r.recomputePossibleWinLocked()
+// }
+
+// // Clear slot #2 (no refunds)
+// func (r *roomLive) clearBoard2For(tid int64) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	tb := r.ownerBoards[tid]
+// 	if tb.B2 != nil {
+// 		delete(r.selected, *tb.B2)
+// 		tb.B2 = nil
+// 		r.ownerBoards[tid] = tb
+// 	}
+// 	r.recomputePossibleWinLocked()
+// }
+
+// // Clear both slots for a user (used on leave)
+// func (r *roomLive) clearBoardsFor(tid int64) {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	tb := r.ownerBoards[tid]
+// 	if tb.B1 != nil {
+// 		delete(r.selected, *tb.B1)
+// 		tb.B1 = nil
+// 	}
+// 	if tb.B2 != nil {
+// 		delete(r.selected, *tb.B2)
+// 		tb.B2 = nil
+// 	}
+// 	r.ownerBoards[tid] = tb
+// 	r.recomputePossibleWinLocked()
+// }
+
+// // Slot-specific wrappers (PUBLIC)
+// func (r *roomLive) setBoard1For(tid int64, board int) (bool, string) {
+// 	return r.setBoardSlotFor(tid, board, 1)
+// }
+// func (r *roomLive) setBoard2For(tid int64, board int) (bool, string) {
+// 	return r.setBoardSlotFor(tid, board, 2)
+// }
+
+// // count of debited users (expects r.mu held)
+
+// // count of debited users (expects r.mu held)
+// // CHANGED: count total paid slots across users
+// func (r *roomLive) debitedCountLocked() int {
+// 	total := 0
+// 	for _, n := range r.debited {
+// 		total += n // each user's paid slot count (0..2)
+// 	}
+// 	return total
+// }
+
+// // Attempt to start *now*, performing the same sequence the countdown would.
+// // snapshot owners without holding the lock long
+// func (r *roomLive) ownersSnapshot() []int64 {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	uniq := make(map[int64]struct{})
+// 	for _, tid := range r.selected {
+// 		uniq[tid] = struct{}{}
+// 	}
+// 	out := make([]int64, 0, len(uniq))
+// 	for tid := range uniq {
+// 		out = append(out, tid)
+// 	}
+// 	return out
+// }
+
+// // Try to charge all selected owners that aren't debited; if charging fails, remove their boards.
+// // Ensure every assigned slot is paid. If charging fails, drop boards until paid count matches.
+// func (r *roomLive) ensureDebitsBeforeStart() {
+// 	r.mu.Lock()
+// 	// Snapshot current selection per user
+// 	type ownerInfo struct{ want int }
+// 	wantByOwner := map[int64]int{}
+// 	for _, tid := range r.selected {
+// 		wantByOwner[tid] = 0
+// 	}
+// 	for tid := range wantByOwner {
+// 		wantByOwner[tid] = r.countBoardsForOwnerLocked(tid)
+// 	}
+// 	// Snapshot current debited counts
+// 	debitedByOwner := map[int64]int{}
+// 	for tid := range wantByOwner {
+// 		debitedByOwner[tid] = r.debited[tid]
+// 	}
+// 	stakeC := r.StakeAmount * 100
+// 	r.mu.Unlock()
+
+// 	// For each owner, try to top up debits to meet `want`
+// 	for tid, want := range wantByOwner {
+// 		for debitedByOwner[tid] < want {
+// 			if err := debitOneUserStake(tid, stakeC, r.RoomID); err != nil {
+// 				// Could not charge -> remove boards until debited count equals the number of kept slots
+// 				r.mu.Lock()
+// 				// remove from slot #2 first, then #1
+// 				tb := r.ownerBoards[tid]
+// 				// total allowed = debitedByOwner[tid]
+// 				allowed := debitedByOwner[tid]
+// 				// Current selected:
+// 				cur := r.countBoardsForOwnerLocked(tid)
+// 				for cur > allowed {
+// 					if tb.B2 != nil {
+// 						delete(r.selected, *tb.B2)
+// 						tb.B2 = nil
+// 						cur--
+// 					} else if tb.B1 != nil {
+// 						delete(r.selected, *tb.B1)
+// 						tb.B1 = nil
+// 						cur--
+// 					} else {
+// 						break
+// 					}
+// 				}
+// 				r.ownerBoards[tid] = tb
+// 				r.mu.Unlock()
+// 				break
+// 			}
+// 			// success
+// 			debitedByOwner[tid]++
+// 			r.mu.Lock()
+// 			r.debited[tid] = debitedByOwner[tid]
+// 			r.mu.Unlock()
+// 		}
+// 	}
+// }
+
+
+// // Attempt to start *now*, performing the same sequence the countdown would.
+// func (r *roomLive) startRoundNowLocked() {
+// 	// Preconditions under lock
+// 	if !r.eligibleToStartLocked() {
+// 		return
+// 	}
+
+
+// 	now := time.Now().UTC()
+// 	r.Status = "playing"
+// 	r.StartedAt = &now
+// 	// initialize deck
+// 	r.called = r.called[:0]
+// 	r.callSeq = shuffled1to75()
+// 	r.callIdx = 0
+// 	// 🔥 ADD THIS
+// 	r.CallLevel = callLevelForToday()
+// 	// stop any countdown
+// 	r.countdownRunning = false
+// 	if r.countdownCancelCh != nil {
+// 		close(r.countdownCancelCh)
+// 		r.countdownCancelCh = nil
+// 	}
+// 	r.mu.Unlock()
+
+// 	// Make sure every selected slot is paid or removed
+// 	r.ensureDebitsBeforeStart()
+
+// 	// Recompute pot based on paid slots and freeze it
+// 	r.recomputePossibleWin()
+// 	r.mu.Lock()
+// 	r.roundPayoutCents = r.PossibleWinCents
+
+// 	// If nobody (no paid slots), abort round
+// 	if r.debitedCountLocked() == 0 {
+// 		r.Status = "pending"
+// 		r.StartTime = nil
+// 		r.StartedAt = nil
+// 		r.stopCallingLocked()
+// 		r.called = r.called[:0]
+// 		r.callSeq = nil
+// 		r.callIdx = 0
+// 		r.mu.Unlock()
+
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 		return
+// 	}
+
+// 	// Start calling
+// 	r.mu.Unlock()
+// 	r.startCalling()
+
+// 	// persist + broadcast
+// 	saveRoomStateToDB(r)
+// 	globalRoomsHub.broadcastRooms()
+// 	r.broadcastRoomStateToConns()
+// }
+
+// func (r *roomLive) maybeStartCountdown() {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	r.maybeStartCountdownLocked()
+// }
+
+// func (r *roomLive) maybeStartCountdownLocked() {
+// 	// start only if currently idle/pending and thresholds met
+// 	switch r.Status {
+// 	case "Ready", "pending":
+// 		if r.eligibleToStartLocked() {
+// 			ft := time.Now().Add(45 * time.Second).UTC()
+// 			r.StartTime = &ft
+// 			r.StartedAt = nil
+// 			r.Status = "about_to_start"
+// 			r.startCountdownLocked()
+// 		}
+// 	case "about_to_start":
+// 		// if thresholds dropped, cancel countdown
+// 		if !r.eligibleToStartLocked() {
+// 			r.Status = "pending"
+// 			r.StartTime = nil
+// 			r.StartedAt = nil
+// 			r.stopCountdownLocked()
+// 		}
+// 	}
+// }
+
+// func (r *roomLive) startCountdownLocked() {
+// 	if r.countdownRunning {
+// 		return
+// 	}
+// 	r.countdownRunning = true
+// 	r.countdownCancelCh = make(chan struct{})
+
+// 	cancel := r.countdownCancelCh
+
+// 	go func() {
+// 		tick := time.NewTicker(500 * time.Millisecond)
+// 		defer tick.Stop()
+// 		for {
+// 			select {
+// 			case <-cancel:
+// 				return
+// 			case <-tick.C:
+// 				r.mu.Lock()
+// 				// re-check eligibility and planned start on each tick
+// 				if r.Status != "about_to_start" || !r.eligibleToStartLocked() {
+// 					// thresholds dropped or state changed — cancel
+// 					r.countdownRunning = false
+// 					if r.countdownCancelCh != nil {
+// 						close(r.countdownCancelCh)
+// 						r.countdownCancelCh = nil
+// 					}
+// 					r.StartTime = nil
+// 					r.StartedAt = nil
+// 					r.Status = "pending"
+// 					r.mu.Unlock()
+
+// 					saveRoomStateToDB(r)
+// 					globalRoomsHub.broadcastRooms()
+// 					r.broadcastRoomStateToConns()
+// 					return
+// 				}
+
+// 				var startAt time.Time
+// 				if r.StartTime != nil {
+// 					startAt = r.StartTime.UTC()
+// 				}
+// 				now := time.Now().UTC()
+// 				if r.StartTime == nil || !now.Before(startAt) {
+// 					// flip to playing now (releases the lock internally)
+// 					r.startRoundNowLocked()
+// 					return
+// 				}
+// 				r.mu.Unlock()
+// 			}
+// 		}
+// 	}()
+// }
+
+// func (r *roomLive) stopCountdownLocked() {
+// 	if !r.countdownRunning {
+// 		return
+// 	}
+// 	close(r.countdownCancelCh)
+// 	r.countdownRunning = false
+// 	r.countdownCancelCh = nil
+// }
+
+// // Repair room state after restoring from DB (e.g., after restart)
+// func (r *roomLive) repairAfterRestore() {
+// 	r.mu.Lock()
+// 	switch r.Status {
+// 	case "about_to_start":
+// 		// If start time passed and thresholds met -> start now
+// 		if r.StartTime != nil && time.Now().UTC().After(r.StartTime.UTC()) && r.eligibleToStartLocked() {
+// 			// startRoundNowLocked expects the lock held and will release it internally.
+// 			// Do not defer/unlock here; just return after the call.
+// 			r.startRoundNowLocked()
+// 			return
+// 		}
+// 		// If thresholds not met -> revert to pending
+// 		if !r.eligibleToStartLocked() {
+// 			r.Status = "pending"
+// 			r.StartTime = nil
+// 			r.StartedAt = nil
+// 			r.stopCountdownLocked()
+// 			r.mu.Unlock()
+
+// 			saveRoomStateToDB(r)
+// 			return
+// 		}
+// 		// thresholds OK and start time still in future: ensure countdown is running
+// 		r.startCountdownLocked()
+// 		r.mu.Unlock()
+// 		return
+
+// 	case "claimed":
+// 		// We were in the post-win settle window when the process died.
+// 		// No in-memory timer survives a restart → reset immediately.
+// 		r.mu.Unlock()
+
+// 		r.resetForNextRoundLocked()
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 		return
+
+// 	case "playing":
+// 		// Ensure debits & correct frozen payout before (re)starting calls
+// 		r.mu.Unlock()
+
+// 		r.ensureDebitsBeforeStart()
+// 		r.recomputePossibleWin()
+
+// 		r.mu.Lock()
+// 		r.roundPayoutCents = r.PossibleWinCents
+
+// 		// If somehow playing but no deck initialized, initialize minimal safe state
+// 		if r.callSeq == nil || len(r.callSeq) == 0 {
+// 			r.called = r.called[:0]
+// 			r.callSeq = shuffled1to75()
+// 			r.callIdx = 0
+// 			// ensure calling is running
+// 			r.mu.Unlock()
+// 			r.startCalling()
+// 			return
+// 		}
+// 		r.mu.Unlock()
+// 		return
+
+// 	default:
+// 		// Ready / pending: nothing special to do
+// 		r.mu.Unlock()
+// 		return
+// 	}
+// }
+
+// /* ============================================================
+//    Debit logic - NOW AT BOARD SELECTION
+// ============================================================ */
+
+// // Deduct stake: first from MainBalanceCents, then from BalanceCents (if needed).
+// func debitOneUserStake(tid int64, amountCents int64, roomID string) error {
+// 	if amountCents <= 0 {
+// 		return nil
+// 	}
+
+// 	return db.Transaction(func(tx *gorm.DB) error {
+// 		var u User
+// 		// lock user row
+// 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+// 			Where("telegram_id = ?", tid).
+// 			First(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		main := u.MainBalanceCents
+// 		aux := u.BalanceCents
+// 		total := main + aux
+// 		if total < amountCents {
+// 			return fmt.Errorf("insufficient balance")
+// 		}
+
+// 		// Prefer taking from main, spill into aux if needed
+// 		useFromMain := min(amountCents, main)
+// 		useFromAux := amountCents - useFromMain
+
+// 		u.MainBalanceCents = main - useFromMain
+// 		if useFromAux > 0 {
+// 			u.BalanceCents = aux - useFromAux
+// 		}
+
+// 		if err := tx.Save(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		amt := toBirrString(amountCents) // e.g. "25.00"
+// 		zero := "0.00"
+
+// 		// Single transaction record noting the stake
+// 		t := Transaction{
+// 			TelegramID: tid,
+// 			Type:       "stake",
+// 			Method:     "-",
+// 			Status:     "success",
+// 			Note:       fmt.Sprintf("Game stake for room %s (main:%s birr, bonus:%s birr)", roomID, toBirrString(useFromMain), toBirrString(useFromAux)),
+// 			Amount:     amt,
+// 			Bonus:      zero,
+// 			Total:      amt,
+// 			Account:    "",
+// 			Reference:  nil,
+// 			TxID:       nil,
+// 		}
+// 		return tx.Create(&t).Error
+// 	})
+// }
+
+// // Refund stake for one user (leave before game starts) → PLAY balance
+// func refundStakeCents(tid int64, amountCents int64, roomID string, boards int) error {
+// 	if amountCents <= 0 {
+// 		return nil
+// 	}
+
+// 	return db.Transaction(func(tx *gorm.DB) error {
+// 		var u User
+// 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+// 			Where("telegram_id = ?", tid).
+// 			First(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		// ✅ refund PLAY balance
+// 		u.BalanceCents += amountCents
+
+// 		if err := tx.Save(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		amt := toBirrString(amountCents)
+// 		zero := "0.00"
+
+// 		note := fmt.Sprintf("Stake refund for room %s (%d board(s)) → play balance", roomID, boards)
+// 		t := Transaction{
+// 			TelegramID: tid,
+// 			Type:       "stake_refund",
+// 			Method:     "+",
+// 			Status:     "success",
+// 			Note:       note,
+// 			Amount:     amt,
+// 			Bonus:      zero,
+// 			Total:      amt,
+// 			Account:    "balance", // ✅ refund to PLAY balance
+// 		}
+// 		return tx.Create(&t).Error
+// 	})
+// }
+
+// // Credit winner: ALWAYS to MainBalanceCents.
+// func creditWinnerCents(tid int64, amountCents int64, roomID string) error {
+// 	if amountCents <= 0 {
+// 		return nil
+// 	}
+// 	return db.Transaction(func(tx *gorm.DB) error {
+// 		var u User
+// 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+// 			Where("telegram_id = ?", tid).
+// 			First(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		u.MainBalanceCents += amountCents
+
+// 		if err := tx.Save(&u).Error; err != nil {
+// 			return err
+// 		}
+
+// 		amt := toBirrString(amountCents)
+// 		zero := "0.00"
+
+// 		t := Transaction{
+// 			TelegramID: tid,
+// 			Type:       "win",
+// 			Method:     "+",
+// 			Status:     "success",
+// 			Note:       fmt.Sprintf("Win payout for room %s → main balance", roomID),
+// 			Amount:     amt,
+// 			Bonus:      zero,
+// 			Total:      amt,
+// 		}
+// 		return tx.Create(&t).Error
+// 	})
+// }
+
+// /* ============================================================
+//    Round finalization (winner -> stop, pay, broadcast)
+// ============================================================ */
+
+// // Round ends immediately with a single winner (used by immediate-claim paths).
+// // Returns true if the round transitioned into a winner state.
+// func (r *roomLive) endRoundWithWinner(winnerTID int64, winnerBoard int, matched []int, winnerFirstName string) bool {
+// 	// Make the winner decision atomically under lock
+// 	r.mu.Lock()
+// 	// With two-board support, winner must have paid at least one slot this round.
+// 	if r.Status != "playing" || r.debited[winnerTID] <= 0 {
+// 		r.mu.Unlock()
+// 		return false
+// 	}
+
+// 	// Transition to claimed and stop calling
+// 	r.Status = "claimed"
+// 	payoutCents := r.roundPayoutCents // already frozen at round start
+// 	r.stopCallingLocked()
+// 	r.mu.Unlock()
+
+// 	// Credit the winner outside the lock
+// 	if payoutCents < 0 {
+// 		payoutCents = 0
+// 	}
+// 	if err := creditWinnerCents(winnerTID, payoutCents, r.RoomID); err != nil {
+// 		log.Println("creditWinnerCents error:", err)
+// 	}
+
+// 	// Prepare amounts / strings
+// 	winBirr := float64(payoutCents) / 100.0
+// 	amtStr := fmt.Sprintf("%.2f Birr", winBirr)
+// 	matchStr := fmt.Sprint(matched) // e.g. [7 12 23 39 51]
+
+// 	// 1) Winner-only WebSocket message
+// 	winnerOnly := map[string]any{
+// 		"type":                "winner_congrats",
+// 		"message":             fmt.Sprintf("🎉 Congratulations %s!\nYou won: %s\nDire Bingo", winnerFirstName, amtStr),
+// 		"win_amount":          winBirr,
+// 		"win_amount_str":      amtStr,
+// 		"winner_board_number": winnerBoard,
+// 		"matched_to":          matched,
+// 	}
+// 	for _, c := range r.snapshotConns() {
+// 		if c.tid == winnerTID {
+// 			c.enqueueJSON(winnerOnly)
+// 		}
+// 	}
+
+// 	// 2) Telegram: notify admins group
+// 	adminText := fmt.Sprintf(
+// 		"🎉 *Dire Bingo* — Winner ✅\n\n"+
+// 			"*Stake:* %d Birr\n"+
+// 			"*Amount:* *%s*\n"+
+// 			"*Winner:* [%s](tg://user?id=%d)\n"+
+// 			"*Board:* `%d`\n",
+// 		r.StakeAmount, amtStr, winnerFirstName, winnerTID, winnerBoard,
+// 	)
+// 	if err := sendTelegramMessage(AdminNotifyChatID, adminText); err != nil {
+// 		log.Println("telegram admin notify error:", err)
+// 	}
+
+// 	// 3) Telegram: DM the winner
+// 	userText := fmt.Sprintf(
+// 		"🎉 *Congratulations %s!*\nYou won: *%s*\nRoom: `%s`\nBoard: %d\nMatched: `%s`\n\nDire Bingo",
+// 		winnerFirstName, amtStr, r.RoomID, winnerBoard, matchStr,
+// 	)
+// 	if err := sendTelegramMessage(winnerTID, userText); err != nil {
+// 		log.Println("telegram user notify error:", err)
+// 	}
+
+// 	// 4) Broadcast to everyone
+// 	winMsg := map[string]any{
+// 		"type": "winners",
+// 		"winners": []map[string]any{
+// 			{
+// 				"is_self":             false,
+// 				"win_amount":          winBirr,
+// 				"winner_board_number": winnerBoard,
+// 				"matched_to":          matched,
+// 				"user": map[string]any{
+// 					"first_name": winnerFirstName,
+// 				},
+// 			},
+// 		},
+// 	}
+// 	for _, c := range r.snapshotConns() {
+// 		c.enqueueJSON(winMsg)
+// 	}
+
+// 	// 5) Persist + lobby refresh + per-room snapshots
+// 	saveRoomStateToDB(r)
+// 	globalRoomsHub.broadcastRooms()
+// 	r.broadcastRoomStateToConns()
+
+// 	// 6) Short settling window, then reset
+// 	time.AfterFunc(claimedSettle, func() {
+// 		r.resetForNextRoundLocked()
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 	})
+
+// 	return true
+// }
+
+// // End round with no winner (deck exhausted)
+// func (r *roomLive) endRoundNoWinner() {
+// 	r.mu.Lock()
+// 	if r.Status != "playing" {
+// 		r.mu.Unlock()
+// 		return
+// 	}
+// 	r.Status = "claimed" // reuse existing terminal state
+// 	r.stopCallingLocked()
+// 	r.mu.Unlock()
+
+// 	saveRoomStateToDB(r)
+// 	globalRoomsHub.broadcastRooms()
+// 	r.broadcastRoomStateToConns()
+
+// 	time.AfterFunc(claimedSettle, func() {
+// 		r.resetForNextRoundLocked()
+// 		saveRoomStateToDB(r)
+// 		globalRoomsHub.broadcastRooms()
+// 		r.broadcastRoomStateToConns()
+// 	})
+// }
+
+// // TryClaim now ignores the client-sent board number and uses the player's assigned board.
+// // We keep only essential checks: game is playing, user actually has a board, bingo check.
+// func (r *roomLive) TryClaim(tid int64, _ int, reqID, winnerFirstName string) map[string]any {
+// 	// Must be playing
+// 	r.mu.Lock()
+// 	status := r.Status
+// 	paidCount := r.debited[tid] // number of paid slots
+// 	r.mu.Unlock()
+// 	if status != "playing" {
+// 		return map[string]any{
+// 			"type": "claim_result", "request_id": reqID, "ok": false,
+// 			"reason": "not_playing", "message": "Game is not in playing state.",
+// 		}
+// 	}
+// 	if paidCount <= 0 {
+// 		return map[string]any{
+// 			"type": "claim_result", "request_id": reqID, "ok": false,
+// 			"reason": "not_paid", "message": "You have not paid for this round.",
+// 		}
+// 	}
+
+// 	boards := r.boardsFor(tid)
+// 	if len(boards) == 0 {
+// 		return map[string]any{
+// 			"type": "claim_result", "request_id": reqID, "ok": false,
+// 			"reason": "no_board_selected", "message": "You haven't selected a board.",
+// 		}
+// 	}
+
+// 	calledSnap := r.calledSnapshot()
+// 	var winBoard int
+// 	var matched []int
+// 	found := false
+// 	for _, bno := range boards {
+// 		b, ok := getBoard(bno)
+// 		if !ok {
+// 			continue
+// 		}
+// 		won, m := checkBingo(b, calledSnap)
+// 		if won {
+// 			winBoard = bno
+// 			matched = m
+// 			found = true
+// 			break
+// 		}
+// 	}
+// 	if !found {
+// 		return map[string]any{
+// 			"type": "claim_result", "request_id": reqID, "ok": false,
+// 			"reason": "no_bingo", "message": "Invalid Bingo, You don't won.",
+// 		}
+// 	}
+
+// 	// Open/add to claim window
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	if r.Status != "playing" && r.Status != "about_to_start" && r.Status != "pending" {
+// 		return map[string]any{
+// 			"type": "claim_result", "request_id": reqID, "ok": false,
+// 			"reason": "already_claimed", "message": "Another player has already claimed.",
+// 		}
+// 	}
+// 	if !r.claimOpen {
+// 		r.openClaimWindowLocked()
+// 	}
+// 	if time.Now().Before(r.claimUntil) || time.Now().Equal(r.claimUntil) {
+// 		r.addClaimantLocked(tid, winBoard, matched, winnerFirstName)
+// 		remainMs := time.Until(r.claimUntil).Milliseconds()
+// 		if remainMs < 0 {
+// 			remainMs = 0
+// 		}
+// 		return map[string]any{
+// 			"type":                 "claim_result",
+// 			"request_id":           reqID,
+// 			"ok":                   true,
+// 			"winner_board_number":  winBoard,
+// 			"matched_to":           matched,
+// 			"claim_window_ms_left": remainMs,
+// 			"message":              "Claim received. Finalizing winners shortly…",
+// 		}
+// 	}
+// 	return map[string]any{
+// 		"type": "claim_result", "request_id": reqID, "ok": false,
+// 		"reason": "window_closed", "message": "Claim window has closed.",
+// 	}
+// }
+
+// func isBotUser(tid int64) bool {
+// 	var u User
+// 	if err := db.Select("is_bot").Where("telegram_id = ?", tid).First(&u).Error; err != nil {
+// 		// If we can't read the user, assume human so we don't silence legit users.
+// 		return false
+// 	}
+// 	return u.IsBot
+// }
+// func isABotUser(telegramID int64) bool {
+//     zeroCount := 0
+//     id := telegramID
+//     for id > 0 {
+//         if id%10 == 0 {
+//             zeroCount++
+//             if zeroCount > 4 {
+//                 return true
+//             }
+//         }
+//         id /= 10
+//     }
+//     return false
+// }
+
+// /* ============================================================
+//    Calling loop helpers
+// ============================================================ */
+
+// func shuffled1to75() []int {
+// 	nums := make([]int, 75)
+// 	for i := 0; i < 75; i++ {
+// 		nums[i] = i + 1
+// 	}
+// 	rand.Seed(time.Now().UnixNano())
+// 	rand.Shuffle(len(nums), func(i, j int) { nums[i], nums[j] = nums[j], nums[i] })
+// 	return nums
+// }
+
+// func (r *roomLive) startCalling() {
+// 	r.mu.Lock()
+// 	if r.calling {
+// 		r.mu.Unlock()
+// 		return
+// 	}
+// 	r.calling = true
+// 	r.callStopCh = make(chan struct{})
+// 	interval := r.callInterval
+// 	r.mu.Unlock()
+
+// 	ticker := time.NewTicker(interval)
+
+// 	r.mu.Lock()
+// 	r.callTicker = ticker
+// 	r.mu.Unlock()
+
+// 	go func() {
+// 		defer func() {
+// 			ticker.Stop()
+// 			r.mu.Lock()
+// 			r.calling = false
+// 			r.callTicker = nil
+// 			r.callStopCh = nil
+// 			r.mu.Unlock()
+// 		}()
+
+// 		for {
+// 			select {
+// 			case <-r.callStopCh:
+// 				return
+// 			case <-ticker.C:
+// 				if !r.callNextNumber() {
+// 					return
+// 				}
+// 			}
+// 		}
+// 	}()
+// }
+
+// func (r *roomLive) stopCallingLocked() {
+// 	if !r.calling || r.callStopCh == nil {
+// 		return
+// 	}
+// 	close(r.callStopCh)
+// }
+
+// func (r *roomLive) callNextNumber() bool {
+// 	// Update state under lock
+// 	r.mu.Lock()
+// 	if r.Status != "playing" {
+// 		r.mu.Unlock()
+// 		return false
+// 	}
+// 	if r.callSeq == nil || r.callIdx >= len(r.callSeq) {
+// 		// deck exhausted → no winner
+// 		r.mu.Unlock()
+// 		r.endRoundNoWinner()
+// 		return false
+// 	}
+// 	var next int
+
+// 	if r.CallLevel == 0 {
+// 		// ORIGINAL behavior
+// 		next = r.callSeq[r.callIdx]
+// 		r.callIdx++
+	
+// 	} else {
+// 		// LEVEL 1 behavior
+// 		found := false
+	
+// 		for r.callIdx < len(r.callSeq) {
+// 			candidate := r.callSeq[r.callIdx]
+// 			r.callIdx++
+	
+// 			if !r.numberCausesHumanWin(candidate) {
+// 				next = candidate
+// 				found = true
+// 				break
+// 			}
+// 		}
+	
+// 		// fallback (no safe numbers left)
+// 		if !found {
+// 			next = r.callSeq[r.callIdx-1]
+// 		}
+// 	}
+	
+// 	r.called = append(r.called, next)
+	
+
+
+// 	calledCopy := append([]int(nil), r.called...)
+// 	r.mu.Unlock()
+
+// 	// Broadcast to room conns outside the lock
+// 	msg := map[string]any{
+// 		"type":           "called_numbers",
+// 		"called_numbers": calledCopy,
+// 	}
+// 	for _, c := range r.snapshotConns() {
+// 		c.enqueueJSON(msg)
+// 	}
+// 	return true
+// }
+
+// // snapshot of called numbers
+// func (r *roomLive) calledSnapshot() []int {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	cp := make([]int, len(r.called))
+// 	copy(cp, r.called)
+// 	return cp
+// }
+
+// /* ============================================================
+//    Win checking helpers (rows/cols/diagonals/corners)
+// ============================================================ */
+
+// func lineMatched(nums []int, calledSet map[int]bool) bool {
+// 	for _, n := range nums {
+// 		if n == 0 { // FREE
+// 			continue
+// 		}
+// 		if !calledSet[n] {
+// 			return false
+// 		}
+// 	}
+// 	return true
+// }
+
+// func filterNonZero(xs []int) []int {
+// 	out := make([]int, 0, len(xs))
+// 	for _, v := range xs {
+// 		if v != 0 {
+// 			out = append(out, v)
+// 		}
+// 	}
+// 	return out
+// }
+
+// func checkBingo(b Board, called []int) (ok bool, matchedTo []int) {
+// 	calledSet := make(map[int]bool, len(called))
+// 	for _, n := range called {
+// 		calledSet[n] = true
+// 	}
+
+// 	// rows
+// 	for r := 0; r < 5; r++ {
+// 		line := []int{b[r][0], b[r][1], b[r][2], b[r][3], b[r][4]}
+// 		if lineMatched(line, calledSet) {
+// 			return true, filterNonZero(line)
+// 		}
+// 	}
+// 	// cols
+// 	for c := 0; c < 5; c++ {
+// 		line := []int{b[0][c], b[1][c], b[2][c], b[3][c], b[4][c]}
+// 		if lineMatched(line, calledSet) {
+// 			return true, filterNonZero(line)
+// 		}
+// 	}
+// 	// diagonals
+// 	diag := []int{b[0][0], b[1][1], b[2][2], b[3][3], b[4][4]}
+// 	if lineMatched(diag, calledSet) {
+// 		return true, filterNonZero(diag)
+// 	}
+// 	adiag := []int{b[0][4], b[1][3], b[2][2], b[3][1], b[4][0]}
+// 	if lineMatched(adiag, calledSet) {
+// 		return true, filterNonZero(adiag)
+// 	}
+// 	// corners
+// 	corners := []int{b[0][0], b[0][4], b[4][0], b[4][4]}
+// 	if lineMatched(corners, calledSet) {
+// 		return true, filterNonZero(corners)
+// 	}
+// 	return false, nil
+// }
+
+// /* ============================================================
+//    Reset round (expects r.mu to be held inside)
+// ============================================================ */
+
+// func (r *roomLive) resetForNextRoundLocked() {
+// 	r.mu.Lock()
+// 	defer r.mu.Unlock()
+// 	r.Status = "Ready"
+// 	r.StartTime = nil
+// 	r.StartedAt = nil
+// 	r.stopCountdownLocked()
+// 	r.stopCallingLocked()
+// 	r.selected = make(map[int]int64)
+// 	r.ownerBoards = make(map[int64]twoBoards) // NEW
+// 	r.debited = make(map[int64]int)           // CHANGED
+// 	r.PossibleWinCents = 0
+// 	r.roundPayoutCents = 0
+// 	r.called = r.called[:0]
+// 	r.callSeq = nil
+// 	r.callIdx = 0
+// 	r.claimOpen = false
+// 	r.claimUntil = time.Time{}
+// 	if r.claimTimer != nil {
+// 		r.claimTimer.Stop()
+// 		r.claimTimer = nil
+// 	}
+// 	r.claimants = make(map[int64]claimant)
+// }
+
+// /* ============================================================
+//    Hub: /ws/rooms (lobby)
+// ============================================================ */
+
+// type roomsClient struct {
+// 	conn *websocket.Conn
+// 	send chan []byte
+// }
+
+// type roomsHub struct {
+// 	clients    map[*roomsClient]bool
+// 	register   chan *roomsClient
+// 	unregister chan *roomsClient
+
+// 	mu    sync.RWMutex
+// 	rooms map[string]*roomLive
+// }
+
+// var globalRoomsHub *roomsHub
+
+// func newRoomsHub() *roomsHub {
+// 	return &roomsHub{
+// 		clients:    make(map[*roomsClient]bool),
+// 		register:   make(chan *roomsClient),
+// 		unregister: make(chan *roomsClient),
+// 		rooms:      make(map[string]*roomLive),
+// 	}
+// }
+
+// func (h *roomsHub) run() {
+// 	log.Println("[roomsHub] running")
+// 	for {
+// 		select {
+// 		case c := <-h.register:
+// 			h.clients[c] = true
+// 		case c := <-h.unregister:
+// 			if _, ok := h.clients[c]; ok {
+// 				delete(h.clients, c)
+// 				close(c.send)
+// 			}
+// 		}
+// 	}
+// }
+
+// // wipe all board reservations in DB for this room
+// func clearAllBoardsInDB(roomID string) error {
+// 	return db.Model(&RoomPlayer{}).
+// 		Where("room_id = ?", roomID).
+// 		Updates(map[string]any{
+// 			"board_number":  gorm.Expr("NULL"),
+// 			"board_number2": gorm.Expr("NULL"),
+// 			"updated_at":    time.Now(),
+// 		}).Error
+// }
+
+// func (r *roomLive) broadcastRoomStateToConns() {
+// 	conns := r.snapshotConns()
+// 	dto := r.toDTO()
+// 	for _, c := range conns {
+// 		boards := r.boardsFor(c.tid) // returns []int with slot1, slot2
+// 		var b1, b2 *int
+// 		if len(boards) > 0 {
+// 			v := boards[0]
+// 			b1 = &v
+// 		}
+// 		if len(boards) > 1 {
+// 			v2 := boards[1]
+// 			b2 = &v2
+// 		}
+
+// 		c.enqueueJSON(map[string]any{
+// 			"type":                "room_state",
+// 			"room":                dto,
+// 			"your_board_number":   b1,
+// 			"your_board_number_2": b2, // 👈 NEW
+// 		})
+// 	}
+// }
+
+// // reset to a fresh idle state (after a win) + DB clear
+// func (r *roomLive) resetRoomToIdleFresh() {
+// 	r.resetForNextRoundLocked()
+
+// 	if err := clearAllBoardsInDB(r.RoomID); err != nil {
+// 		log.Println("clearAllBoardsInDB:", err)
+// 	}
+
+// 	saveRoomStateToDB(r)
+// 	globalRoomsHub.broadcastRooms()
+// 	r.broadcastRoomStateToConns()
+// }
+
+// func (h *roomsHub) snapshot() []RoomStateDTO {
+// 	h.mu.RLock()
+// 	defer h.mu.RUnlock()
+
+// 	out := make([]RoomStateDTO, 0, len(h.rooms))
+// 	for _, r := range h.rooms {
+// 		out = append(out, r.toDTO())
+// 	}
+// 	sort.Slice(out, func(i, j int) bool { return out[i].StakeAmount < out[j].StakeAmount })
+// 	return out
+// }
+
+// func (h *roomsHub) broadcastRooms() {
+// 	payload, _ := json.Marshal(h.snapshot())
+// 	for c := range h.clients {
+// 		select {
+// 		case c.send <- payload:
+// 		default:
+// 			delete(h.clients, c)
+// 			close(c.send)
+// 		}
+// 	}
+// }
+
+// func (h *roomsHub) replaceAll(rooms []*roomLive) {
+// 	h.mu.Lock()
+// 	defer h.mu.Unlock()
+// 	h.rooms = make(map[string]*roomLive, len(rooms))
+// 	for _, r := range rooms {
+// 		h.rooms[r.RoomID] = r
+// 		// Ensure any restored "about_to_start" or "playing" rooms are repaired
+// 		go r.repairAfterRestore()
+// 	}
+// }
+
+// func (h *roomsHub) getOrCreateRoom(id string, stake int64) *roomLive {
+// 	h.mu.Lock()
+// 	defer h.mu.Unlock()
+// 	if r, ok := h.rooms[id]; ok {
+// 		return r
+// 	}
+// 	r := newRoomLive(id, stake)
+// 	h.rooms[id] = r
+// 	return r
+// }
+
+// func (h *roomsHub) getRoom(id string) (*roomLive, bool) {
+// 	h.mu.RLock()
+// 	defer h.mu.RUnlock()
+// 	r, ok := h.rooms[id]
+// 	return r, ok
+// }
+
+// /* ============================================================
+//    DB helpers
+// ============================================================ */
+
+// func loadAllRoomsFromDB() ([]*roomLive, error) {
+// 	var dbRooms []Room
+// 	if err := db.Find(&dbRooms).Error; err != nil {
+// 		return nil, err
+// 	}
+
+// 	roomIDs := make([]string, 0, len(dbRooms))
+// 	for _, r := range dbRooms {
+// 		roomIDs = append(roomIDs, r.RoomID)
+// 	}
+
+// 	var allPlayers []RoomPlayer
+// 	if len(roomIDs) > 0 {
+// 		if err := db.Where("room_id IN ?", roomIDs).Find(&allPlayers).Error; err != nil {
+// 			return nil, err
+// 		}
+// 	}
+
+// 	byRoom := make(map[string][]RoomPlayer)
+// 	for _, p := range allPlayers {
+// 		byRoom[p.RoomID] = append(byRoom[p.RoomID], p)
+// 	}
+
+// 	out := make([]*roomLive, 0, len(dbRooms))
+// 	for _, rm := range dbRooms {
+// 		l := newRoomLive(rm.RoomID, rm.StakeAmount)
+// 		l.Status = rm.Status
+// 		l.PossibleWinCents = rm.PossibleWin
+
+// 		if rm.StartTime != nil {
+// 			t := rm.StartTime.UTC()
+// 			l.StartTime = &t
+// 		}
+// 		if rm.StartedAt != nil {
+// 			t := rm.StartedAt.UTC()
+// 			l.StartedAt = &t
+// 		}
+
+// 		// live connections only
+// 		l.players = make(map[int64]struct{})
+
+// 		// ensure maps exist
+// 		l.ownerBoards = make(map[int64]twoBoards)
+// 		if l.selected == nil {
+// 			l.selected = make(map[int]int64)
+// 		}
+// 		l.debited = make(map[int64]int)
+
+// 		// Restore boards from DB
+// 		for _, p := range byRoom[rm.RoomID] {
+// 			tb := l.ownerBoards[p.TelegramID]
+
+// 			if p.BoardNumber != nil {
+// 				l.selected[*p.BoardNumber] = p.TelegramID
+// 				tb.B1 = p.BoardNumber
+// 			}
+// 			if p.BoardNumber2 != nil {
+// 				l.selected[*p.BoardNumber2] = p.TelegramID
+// 				tb.B2 = p.BoardNumber2
+// 			}
+
+// 			l.ownerBoards[p.TelegramID] = tb
+// 		}
+
+// 		// 🔥 Rebuild debited[] from ownerBoards so ensureDebitsBeforeStart()
+// 		// does NOT double-charge after restart.
+// 		for tid, tb := range l.ownerBoards {
+// 			cnt := 0
+// 			if tb.B1 != nil {
+// 				cnt++
+// 			}
+// 			if tb.B2 != nil {
+// 				cnt++
+// 			}
+// 			if cnt > 0 {
+// 				l.debited[tid] = cnt
+// 			}
+// 		}
+
+// 		// Pot now based on paid slots (debitedCountLocked)
+// 		l.recomputePossibleWinLocked()
+
+// 		out = append(out, l)
+// 	}
+
+// 	return out, nil
+// }
+
+// func saveRoomStateToDB(r *roomLive) {
+// 	var st *time.Time
+// 	if r.StartTime != nil {
+// 		t := r.StartTime.UTC()
+// 		st = &t
+// 	}
+// 	var started *time.Time
+// 	if r.StartedAt != nil {
+// 		t := r.StartedAt.UTC()
+// 		started = &t
+// 	}
+
+// 	res := db.Model(&Room{}).
+// 		Where("room_id = ?", r.RoomID).
+// 		Updates(map[string]any{
+// 			"status":       r.Status,
+// 			"start_time":   st,
+// 			"started_at":   started, // new
+// 			"possible_win": r.PossibleWinCents,
+// 			"updated_at":   time.Now(),
+// 		})
+// 	if res.Error != nil {
+// 		log.Println("saveRoomStateToDB update err:", res.Error)
+// 		return
+// 	}
+// 	if res.RowsAffected == 0 {
+// 		_ = db.Create(&Room{
+// 			RoomID:      r.RoomID,
+// 			StakeAmount: r.StakeAmount,
+// 			Status:      r.Status,
+// 			StartTime:   st,
+// 			StartedAt:   started,
+// 			PossibleWin: r.PossibleWinCents,
+// 		}).Error
+// 	}
+// }
+
+// func listRoomStates() []RoomStateDTO {
+// 	return globalRoomsHub.snapshot()
+// }
+
+// /* ============================================================
+//    upsertRoomPlayer helper
+// ============================================================ */
+
+// func upsertRoomPlayer(roomID string, tid int64, board *int) error {
+// 	rp := RoomPlayer{
+// 		RoomID:      roomID,
+// 		TelegramID:  tid,
+// 		BoardNumber: board,
+// 	}
+// 	return db.Clauses(clause.OnConflict{
+// 		Columns:   []clause.Column{{Name: "room_id"}, {Name: "telegram_id"}},
+// 		DoUpdates: clause.AssignmentColumns([]string{"board_number", "updated_at"}),
+// 	}).Create(&rp).Error
+// }
+
+// /* ============================================================
+//    /ws/rooms handler
+// ============================================================ */
+
+// func wsRoomsHandler(c *gin.Context) {
+// 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+// 	if err != nil {
+// 		log.Println("wsRooms upgrade:", err)
+// 		return
+// 	}
+// 	client := &roomsClient{conn: conn, send: make(chan []byte, LobbyWSSendBuf)}
+// 	globalRoomsHub.register <- client
+
+// 	// send initial snapshot immediately
+// 	initial := globalRoomsHub.snapshot()
+// 	b, _ := json.Marshal(initial)
+// 	client.send <- b
+
+// 	go client.writePump()
+// 	go client.readPump()
+// }
+
+// func (c *roomsClient) writePump() {
+// 	defer func() { _ = c.conn.Close() }()
+// 	t := time.NewTicker(wsPingEvery)
+// 	defer t.Stop()
+
+// 	for {
+// 		select {
+// 		case msg, ok := <-c.send:
+// 			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 			if !ok {
+// 				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+// 				return
+// 			}
+// 			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+// 				return
+// 			}
+// 			// coalesce burst
+// 			n := len(c.send)
+// 			for i := 0; i < n; i++ {
+// 				_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 				if err := c.conn.WriteMessage(websocket.TextMessage, <-c.send); err != nil {
+// 					return
+// 				}
+// 			}
+// 		case <-t.C:
+// 			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 			if err := c.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(wsWriteWait)); err != nil {
+// 				return
+// 			}
+// 		}
+// 	}
+// }
+
+// func (r *roomLive) AttemptClaim(tid int64, _ int, requestID string) (bool, []int, string) {
+// 	first := getUserFirstName(tid)
+// 	res := r.TryClaim(tid, 0, requestID, first)
+
+// 	ok, _ := res["ok"].(bool)
+// 	if !ok {
+// 		reason, _ := res["reason"].(string)
+// 		if reason == "" {
+// 			reason = "unknown"
+// 		}
+// 		return false, nil, reason
+// 	}
+// 	matched := []int{}
+// 	if arr, ok := res["matched_to"].([]any); ok {
+// 		matched = make([]int, 0, len(arr))
+// 		for _, v := range arr {
+// 			switch t := v.(type) {
+// 			case float64:
+// 				matched = append(matched, int(t))
+// 			case int:
+// 				matched = append(matched, t)
+// 			case int64:
+// 				matched = append(matched, int(t))
+// 			}
+// 		}
+// 	}
+// 	return true, matched, ""
+// }
+
+// func (c *roomsClient) readPump() {
+// 	defer func() {
+// 		globalRoomsHub.unregister <- c
+// 		_ = c.conn.Close()
+// 	}()
+// 	c.conn.SetReadLimit(1024)
+// 	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+// 	c.conn.SetPongHandler(func(string) error {
+// 		return c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+// 	})
+// 	for {
+// 		// lobby is write-only; ignore inbound messages
+// 		if _, _, err := c.conn.ReadMessage(); err != nil {
+// 			return
+// 		}
+// 	}
+// }
+
+// /* ============================================================
+//    /ws/room/:room_id (game room)
+// ============================================================ */
+
+// type roomConn struct {
+// 	conn *websocket.Conn
+// 	tid  int64
+// 	room *roomLive
+// 	send chan []byte // buffered outbound queue
+// }
+
+// func (rc *roomConn) enqueueJSON(v any) {
+// 	b, _ := json.Marshal(v)
+
+// 	// if channel is already closed, a plain send will panic
+// 	defer func() {
+// 		if r := recover(); r != nil {
+// 			// channel was closed, just ignore
+// 		}
+// 	}()
+
+// 	select {
+// 	case rc.send <- b:
+// 	default:
+// 		rc.closeSlow()
+// 	}
+// }
+
+// func (rc *roomConn) closeSlow() {
+// 	_ = rc.conn.WriteControl(websocket.CloseMessage, []byte("slow_client"), time.Now().Add(2*time.Second))
+// 	_ = rc.conn.Close()
+// }
+
+// func wsRoomHandler(c *gin.Context) {
+// 	roomID := strings.TrimSpace(c.Param("room_id"))
+// 	if roomID == "" {
+// 		c.String(http.StatusBadRequest, "room_id required")
+// 		return
+// 	}
+// 	token := strings.TrimSpace(c.Query("token"))
+// 	if token == "" {
+// 		c.String(http.StatusUnauthorized, "token required")
+// 		return
+// 	}
+// 	tid, err := parseTIDFromJWT(token)
+// 	if err != nil || tid == 0 {
+// 		c.String(http.StatusUnauthorized, "invalid token")
+// 		return
+// 	}
+
+// 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+// 	if err != nil {
+// 		log.Println("wsRoom upgrade:", err)
+// 		return
+// 	}
+
+// 	// get or build the room
+// 	rm, ok := globalRoomsHub.getRoom(roomID)
+// 	if !ok {
+// 		var dbRoom Room
+// 		// ---------------------------
+// 		//  LAZY RESTORE FROM DB
+// 		// ---------------------------
+// 		if err := db.Where("room_id = ?", roomID).First(&dbRoom).Error; err == nil {
+
+// 			rm = globalRoomsHub.getOrCreateRoom(dbRoom.RoomID, dbRoom.StakeAmount)
+// 			rm.Status = dbRoom.Status
+// 			rm.PossibleWinCents = dbRoom.PossibleWin
+
+// 			if dbRoom.StartTime != nil {
+// 				t := dbRoom.StartTime.UTC()
+// 				rm.StartTime = &t
+// 			}
+// 			if dbRoom.StartedAt != nil {
+// 				t := dbRoom.StartedAt.UTC()
+// 				rm.StartedAt = &t
+// 			}
+
+// 			// ---------------------------
+// 			//  ENSURE MAPS EXIST
+// 			// ---------------------------
+// 			if rm.ownerBoards == nil {
+// 				rm.ownerBoards = make(map[int64]twoBoards)
+// 			}
+// 			if rm.selected == nil {
+// 				rm.selected = make(map[int]int64)
+// 			}
+// 			if rm.debited == nil {
+// 				rm.debited = make(map[int64]int)
+// 			}
+
+// 			// ---------------------------
+// 			//  RESTORE BOARDS FROM DB
+// 			// ---------------------------
+// 			var pls []RoomPlayer
+// 			if err := db.Where("room_id = ?", roomID).Find(&pls).Error; err == nil {
+// 				for _, p := range pls {
+// 					tb := rm.ownerBoards[p.TelegramID]
+
+// 					if p.BoardNumber != nil {
+// 						rm.selected[*p.BoardNumber] = p.TelegramID
+// 						tb.B1 = p.BoardNumber
+// 					}
+// 					if p.BoardNumber2 != nil {
+// 						rm.selected[*p.BoardNumber2] = p.TelegramID
+// 						tb.B2 = p.BoardNumber2
+// 					}
+
+// 					rm.ownerBoards[p.TelegramID] = tb
+// 				}
+// 			}
+
+// 			// ---------------------------
+// 			//  🔥 CRITICAL FIX:
+// 			//  REBUILD DEBITED COUNTS
+// 			// ---------------------------
+// 			for tid2, tb := range rm.ownerBoards {
+// 				count := 0
+// 				if tb.B1 != nil {
+// 					count++
+// 				}
+// 				if tb.B2 != nil {
+// 					count++
+// 				}
+// 				if count > 0 {
+// 					rm.debited[tid2] = count
+// 				}
+// 			}
+
+// 			// Recompute pot AFTER debit rebuild
+// 			rm.recomputePossibleWin()
+
+// 			// Restart-safe fix
+// 			rm.repairAfterRestore()
+
+// 		} else {
+// 			// fallback: create empty room
+// 			rm = globalRoomsHub.getOrCreateRoom(roomID, 0)
+// 		}
+// 	}
+
+// 	// ==========================================================
+// 	//   REMAINING ORIGINAL LOGIC (UNCHANGED)
+// 	// ==========================================================
+
+// 	rc := &roomConn{conn: conn, tid: tid, room: rm, send: make(chan []byte, RoomWSSendBuf)}
+
+// 	rm.registerConn(rc)
+// 	rm.addPlayer(tid)
+
+// 	var rp RoomPlayer
+// 	err = db.Where("room_id = ? AND telegram_id = ?", rm.RoomID, tid).First(&rp).Error
+// 	switch {
+// 	case errors.Is(err, gorm.ErrRecordNotFound):
+// 		_ = upsertRoomPlayerWithTwo(rm.RoomID, tid, nil, nil)
+// 	case err != nil:
+// 		log.Printf("room_player lookup error: %v", err)
+// 	default:
+// 		if rp.BoardNumber != nil {
+// 			rm.setBoard1For(tid, *rp.BoardNumber)
+// 		}
+// 		if rp.BoardNumber2 != nil {
+// 			rm.setBoard2For(tid, *rp.BoardNumber2)
+// 		}
+// 	}
+
+// 	_ = upsertRoomPlayer(rm.RoomID, tid, rp.BoardNumber)
+
+// 	rm.maybeStartCountdown()
+// 	saveRoomStateToDB(rm)
+// 	globalRoomsHub.broadcastRooms()
+// 	rm.broadcastRoomStateToConns()
+
+// 	sendRoomState(rc)
+
+// 	go rc.writePump()
+// 	rc.readPump()
+
+// 	rm.unregisterConn(rc)
+// 	rm.removePlayer(tid)
+// 	_ = upsertRoomPlayerWithTwo(rm.RoomID, tid, nil, nil)
+
+// 	saveRoomStateToDB(rm)
+// 	globalRoomsHub.broadcastRooms()
+// 	rm.broadcastRoomStateToConns()
+// }
+
+// func sendRoomState(rc *roomConn) {
+// 	dto := rc.room.toDTO()
+// 	yourBoard1 := rc.room.boardFor(rc.tid)
+// 	var yourBoard2 *int
+// 	if arr := rc.room.boardsFor(rc.tid); len(arr) > 1 {
+// 		v := arr[1]
+// 		yourBoard2 = &v
+// 	}
+// 	rc.enqueueJSON(map[string]any{
+// 		"type":                "room_state",
+// 		"room":                dto,
+// 		"your_board_number":   yourBoard1,
+// 		"your_board_number_2": yourBoard2, // NEW
+// 	})
+// }
+
+// // NEW: upsert both slots
+// func upsertRoomPlayerWithTwo(roomID string, tid int64, board1, board2 *int) error {
+// 	rp := RoomPlayer{
+// 		RoomID:       roomID,
+// 		TelegramID:   tid,
+// 		BoardNumber:  board1,
+// 		BoardNumber2: board2,
+// 	}
+// 	return db.Clauses(clause.OnConflict{
+// 		Columns:   []clause.Column{{Name: "room_id"}, {Name: "telegram_id"}},
+// 		DoUpdates: clause.AssignmentColumns([]string{"board_number", "board_number2", "updated_at"}),
+// 	}).Create(&rp).Error
+// }
+
+// func (rc *roomConn) writePump() {
+// 	defer func() { _ = rc.conn.Close() }()
+
+// 	t := time.NewTicker(wsPingEvery)
+// 	defer t.Stop()
+
+// 	for {
+// 		select {
+// 		case msg, ok := <-rc.send:
+// 			_ = rc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 			if !ok {
+// 				_ = rc.conn.WriteMessage(websocket.CloseMessage, []byte{})
+// 				return
+// 			}
+// 			if err := rc.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+// 				return
+// 			}
+// 			// coalesce bursts
+// 			n := len(rc.send)
+// 			for i := 0; i < n; i++ {
+// 				_ = rc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 				if err := rc.conn.WriteMessage(websocket.TextMessage, <-rc.send); err != nil {
+// 					return
+// 				}
+// 			}
+// 		case <-t.C:
+// 			_ = rc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+// 			if err := rc.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(wsWriteWait)); err != nil {
+// 				return
+// 			}
+// 		}
+// 	}
+// }
+
+// func (rc *roomConn) readPump() {
+// 	defer func() {
+// 		close(rc.send) // signal writer to exit
+// 		_ = rc.conn.Close()
+// 	}()
+
+// 	rc.conn.SetReadLimit(4096)
+// 	_ = rc.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+// 	rc.conn.SetPongHandler(func(string) error {
+// 		return rc.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+// 	})
+
+// 	for {
+// 		_, data, err := rc.conn.ReadMessage()
+// 		if err != nil {
+// 			return
+// 		}
+// 		var msg map[string]any
+// 		if json.Unmarshal(data, &msg) != nil {
+// 			continue
+// 		}
+
+// 		switch strings.ToLower(fmt.Sprint(msg["action"])) {
+// 		case "set_board":
+// 			// { action: "set_board", board_number: 5 } or null to clear slot #1
+// 			if bn, ok := toIntMaybe(msg["board_number"]); ok {
+// 				if bn <= 0 || bn > maxBoardNumber() {
+// 					rc.sendError("invalid board number")
+// 					continue
+// 				}
+// 				if ok2, reason := rc.room.setBoard1For(rc.tid, bn); !ok2 {
+// 					switch reason {
+// 					case "board_taken":
+// 						rc.sendError("board already taken")
+// 					case "insufficient_balance":
+// 						rc.sendError("insufficient balance")
+// 					default:
+// 						rc.sendError("could not set board")
+// 					}
+// 					continue
+// 				}
+// 				// upsert both slots snapshot
+// 				bs := rc.room.boardsFor(rc.tid)
+// 				var b1, b2 *int
+// 				if len(bs) > 0 {
+// 					b1 = &bs[0]
+// 				}
+// 				if len(bs) > 1 {
+// 					b2 = &bs[1]
+// 				}
+// 				_ = upsertRoomPlayerWithTwo(rc.room.RoomID, rc.tid, b1, b2)
+// 				saveRoomStateToDB(rc.room)
+// 				rc.room.broadcastRoomStateToConns()
+// 				globalRoomsHub.broadcastRooms()
+// 			} else {
+// 				// clear slot #1
+// 				rc.room.clearBoard1For(rc.tid)
+// 				// persist both
+// 				bs := rc.room.boardsFor(rc.tid)
+// 				var b1, b2 *int
+// 				if len(bs) > 0 {
+// 					b1 = &bs[0]
+// 				}
+// 				if len(bs) > 1 {
+// 					b2 = &bs[1]
+// 				}
+// 				_ = upsertRoomPlayerWithTwo(rc.room.RoomID, rc.tid, b1, b2)
+// 				saveRoomStateToDB(rc.room)
+// 				rc.room.broadcastRoomStateToConns()
+// 				globalRoomsHub.broadcastRooms()
+// 			}
+
+// 		case "set_board_2":
+// 			// { action: "set_board_2", board_number: 17 } or null to clear slot #2
+// 			if bn, ok := toIntMaybe(msg["board_number"]); ok {
+// 				if bn <= 0 || bn > maxBoardNumber() {
+// 					rc.sendError("invalid board number")
+// 					continue
+// 				}
+// 				if ok2, reason := rc.room.setBoard2For(rc.tid, bn); !ok2 {
+// 					switch reason {
+// 					case "board_taken":
+// 						rc.sendError("board already taken")
+// 					case "insufficient_balance":
+// 						rc.sendError("insufficient balance")
+// 					default:
+// 						rc.sendError("could not set board")
+// 					}
+// 					continue
+// 				}
+// 				// persist both slots
+// 				bs := rc.room.boardsFor(rc.tid)
+// 				var b1, b2 *int
+// 				if len(bs) > 0 {
+// 					b1 = &bs[0]
+// 				}
+// 				if len(bs) > 1 {
+// 					b2 = &bs[1]
+// 				}
+// 				_ = upsertRoomPlayerWithTwo(rc.room.RoomID, rc.tid, b1, b2)
+// 				saveRoomStateToDB(rc.room)
+// 				rc.room.broadcastRoomStateToConns()
+// 				globalRoomsHub.broadcastRooms()
+// 			} else {
+// 				// clear slot #2
+// 				rc.room.clearBoard2For(rc.tid)
+// 				bs := rc.room.boardsFor(rc.tid)
+// 				var b1, b2 *int
+// 				if len(bs) > 0 {
+// 					b1 = &bs[0]
+// 				}
+// 				if len(bs) > 1 {
+// 					b2 = &bs[1]
+// 				}
+// 				_ = upsertRoomPlayerWithTwo(rc.room.RoomID, rc.tid, b1, b2)
+// 				saveRoomStateToDB(rc.room)
+// 				rc.room.broadcastRoomStateToConns()
+// 				globalRoomsHub.broadcastRooms()
+// 			}
+
+// 		case "leave":
+// 			// Refund only if round has NOT started yet.
+// 			var (
+// 				status      string
+// 				debitedCnt  int
+// 				stakeCents  int64
+// 				refundTotal int64
+// 			)
+
+// 			rc.room.mu.Lock()
+// 			status = rc.room.Status
+// 			debitedCnt = rc.room.debited[rc.tid]   // how many paid slots (0..2)
+// 			stakeCents = rc.room.StakeAmount * 100 // per-slot stake in cents
+
+// 			// Snapshot boards so we can clear them under the same lock
+// 			tb := rc.room.ownerBoards[rc.tid]
+// 			rc.room.mu.Unlock()
+
+// 			// Only refund if not playing / claimed and user actually paid
+// 			if debitedCnt > 0 && status != "playing" && status != "claimed" {
+// 				refundTotal = int64(debitedCnt) * stakeCents
+// 				if err := refundStakeCents(rc.tid, refundTotal, rc.room.RoomID, debitedCnt); err != nil {
+// 					log.Printf("refundStakeCents tid=%d room=%s error: %v", rc.tid, rc.room.RoomID, err)
+// 					// Even if refund fails, clear the debited count so they don't keep "ghost" payments
+// 					rc.room.mu.Lock()
+// 					rc.room.debited[rc.tid] = 0
+// 					rc.room.mu.Unlock()
+// 				} else {
+// 					// Zero out debited count after successful refund
+// 					rc.room.mu.Lock()
+// 					rc.room.debited[rc.tid] = 0
+// 					rc.room.mu.Unlock()
+// 				}
+// 			} else {
+// 				// CRITICAL FIX: Clear debited count even when no refund is due
+// 				// This prevents users from losing money without boards
+// 				rc.room.mu.Lock()
+// 				rc.room.debited[rc.tid] = 0
+// 				rc.room.mu.Unlock()
+// 			}
+
+// 			// Now clear both boards for this user and recompute pot
+// 			rc.room.mu.Lock()
+// 			if tb.B1 != nil {
+// 				delete(rc.room.selected, *tb.B1)
+// 				tb.B1 = nil
+// 			}
+// 			if tb.B2 != nil {
+// 				delete(rc.room.selected, *tb.B2)
+// 				tb.B2 = nil
+// 			}
+// 			rc.room.ownerBoards[rc.tid] = tb
+// 			rc.room.recomputePossibleWinLocked()
+// 			rc.room.mu.Unlock()
+
+// 			// Clear in DB as well
+// 			_ = upsertRoomPlayerWithTwo(rc.room.RoomID, rc.tid, nil, nil)
+
+// 		case "start":
+// 			rc.room.maybeStartCountdown()
+// 			saveRoomStateToDB(rc.room)
+// 			rc.room.broadcastRoomStateToConns()
+// 			globalRoomsHub.broadcastRooms()
+
+// 		case "claim":
+// 			reqID, _ := msg["request_id"].(string)
+// 			first := getUserFirstName(rc.tid)
+// 			// Pass 0 for board; server ignores it now
+// 			res := rc.room.TryClaim(rc.tid, 0, reqID, first)
+// 			rc.enqueueJSON(res)
+// 		}
+// 	}
+// }
+
+// func (rc *roomConn) sendError(s string) {
+// 	rc.enqueueJSON(map[string]any{"type": "error", "error": s})
+// }
+
+// func toIntMaybe(v any) (int, bool) {
+// 	switch t := v.(type) {
+// 	case float64:
+// 		return int(t), true
+// 	case int:
+// 		return t, true
+// 	case int64:
+// 		return int(t), true
+// 	case json.Number:
+// 		if i, err := t.Int64(); err == nil {
+// 			return int(i), true
+// 		}
+// 	}
+// 	return 0, false
+// }
+
+// /* ============================================================
+//    JWT parsing (for ?token=)
+// ============================================================ */
+
+// func parseTIDFromJWT(tokenStr string) (int64, error) {
+// 	secret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+// 	if secret == "" {
+// 		return 0, errors.New("JWT_SECRET not set")
+// 	}
+
+// 	// Parse and validate signature algo
+// 	tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+// 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+// 			return nil, fmt.Errorf("unexpected signing method: %T", t.Method)
+// 		}
+// 		return []byte(secret), nil
+// 	})
+// 	if err != nil {
+// 		return 0, fmt.Errorf("jwt parse error: %w", err)
+// 	}
+// 	if !tok.Valid {
+// 		return 0, errors.New("jwt not valid")
+// 	}
+
+// 	claims, ok := tok.Claims.(jwt.MapClaims)
+// 	if !ok {
+// 		return 0, errors.New("jwt claims not a MapClaims")
+// 	}
+
+// 	// If exp is present, ensure it's still valid
+// 	if v, ok := claims["exp"]; ok {
+// 		switch t := v.(type) {
+// 		case float64:
+// 			if time.Now().Unix() >= int64(t) {
+// 				return 0, errors.New("jwt expired")
+// 			}
+// 		case json.Number:
+// 			n, _ := t.Int64()
+// 			if time.Now().Unix() >= n {
+// 				return 0, errors.New("jwt expired")
+// 			}
+// 		case string:
+// 			if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+// 				if time.Now().Unix() >= n {
+// 					return 0, errors.New("jwt expired")
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	// Accept several common keys for the Telegram/user id
+// 	var raw any
+// 	var found bool
+// 	for _, k := range []string{"tid", "telegram_id", "sub"} {
+// 		if vv, ok := claims[k]; ok {
+// 			raw = vv
+// 			found = true
+// 			break
+// 		}
+// 	}
+// 	if !found {
+// 		return 0, errors.New("no tid/telegram_id/sub claim")
+// 	}
+
+// 	// Coerce to int64
+// 	switch t := raw.(type) {
+// 	case float64:
+// 		return int64(t), nil
+// 	case int64:
+// 		return t, nil
+// 	case json.Number:
+// 		if n, err := t.Int64(); err == nil {
+// 			return n, nil
+// 		}
+// 	case string:
+// 		if n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64); err == nil {
+// 			return n, nil
+// 		}
+// 	}
+
+// 	return 0, errors.New("unable to parse tid as int64")
+// }
+
+// // Small helper (kept near DB helpers)
+// func getUserFirstName(tid int64) string {
+// 	var u User
+// 	if err := db.Select("first_name").Where("telegram_id = ?", tid).First(&u).Error; err == nil {
+// 		if strings.TrimSpace(u.FirstName) != "" {
+// 			return strings.TrimSpace(u.FirstName)
+// 		}
+// 	}
+// 	return "Player"
+// }

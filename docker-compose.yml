@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB} -h 127.0.0.1 -p ${PG_PORT}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - default
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go-app
+    environment:
+      - PORT=${PORT}
+      - PG_HOST=${PG_HOST}              # tip: use 'postgres' here if both are in same compose
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DB=${PG_DB}
+      - PG_PORT=${PG_PORT}
+      - PG_SSLMODE=${PG_SSLMODE}
+      - PG_DSN=host=${PG_HOST} user=${PG_USER} password=${PG_PASSWORD} dbname=${PG_DB} port=${PG_PORT} sslmode=${PG_SSLMODE}
+      - JWT_SECRET=${JWT_SECRET}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - BOTS_ENABLED=true
+      - BOTS_WS_BASE=wss://henb.teshie.dev
+      - BOTS_ROOMS=10,20,50
+      - BOTS_PER_ROOM=30
+      - BOTS_JOIN_JITTER_MS=1500
+      - BOTS_REACTION_MS_MIN=300
+      - BOTS_REACTION_MS_MAX=1200
+      - BOTS_MISS_CHANCE_PCT=3
+      - BOTS_BOARD_SELECT_STYLE=random
+      - REFERRAL_ALLOW_DUPLICATE=${REFERRAL_ALLOW_DUPLICATE}
+      - REFERRAL_CREDIT_EXISTING_USERS=${REFERRAL_CREDIT_EXISTING_USERS}
+      - REFERRAL_REWARD_BIRR=${REFERRAL_REWARD_BIRR}
+      - NEW_USER_BONUS_BIRR=${NEW_USER_BONUS_BIRR}
+      - REFERRAL_INVITEE_BIRR=${REFERRAL_INVITEE_BIRR}
+      - REFERRAL_NOTIFY=${REFERRAL_NOTIFY}
+    ports:
+    - "8001:${PORT}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - default
+
+volumes:
+  pgdata:
+
+networks:
+  default:
+    driver: bridge

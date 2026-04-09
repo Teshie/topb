@@ -1,0 +1,43 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build outputs
+bin/
+build/
+dist/
+
+# Logs
+*.log
+logs/
+
+# Dependency directories (if any vendored)
+vendor/
+# Docker
+docker-compose.override.yml
+caddy-data/
+caddy-config/
+pgdata/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node (if frontend ever mixed in)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+-e 
+# Environment files
+*.env
+*.env.*
