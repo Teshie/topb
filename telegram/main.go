@@ -152,11 +152,11 @@ var (
 	AdminSupergroup int64 = -1002877017597
 
 	PayeeName  = "Henok"
-	PayeePhone = "0915418674"
+	PayeePhone = "0985936645"
 
-	TelebirrAgentAcct  = "0915418674"
-	NigedBankAgentAcct = "1000517969005"
-	EBIRRAgentAcct     = "0915418674"
+	TelebirrAgentAcct  = "0985936645"
+	NigedBankAgentAcct = "1000091369447"
+	EBIRRAgentAcct     = "0985936645"
 	AbyssiniaAgentAcct = "147857373"
 
 	SupportHandle1 = "@"
@@ -178,10 +178,10 @@ var (
 	NotifyChatID int64 = -5132012623
 
 	// Require credited party to be this exact person (tokenized match)
-	AllowedTelebirrReceiverName = getenvDefault("ALLOWED_RECEIVER_TELEBIRR", "Henok Belay Mendefro")
-	AllowedCBEBirrReceiverName  = getenvDefault("ALLOWED_RECEIVER_CBE", "HENOK BELAY MANDEFRO")
+	AllowedTelebirrReceiverName = getenvDefault("ALLOWED_RECEIVER_TELEBIRR", "niguse derse Dameta")
+	AllowedCBEBirrReceiverName  = getenvDefault("ALLOWED_RECEIVER_CBE", "NIGUSS DIRESS DAMITIE")
 	AllowedBOAReceiverName      = getenvDefault("ALLOWED_RECEIVER_BOA", "HENOK BELAY MANDEFRO")
-	AllowedEBirrReceiverName    = getenvDefault("ALLOWED_RECEIVER_EBIRR", "Henok Belay Mandafro")
+	AllowedEBirrReceiverName    = getenvDefault("ALLOWED_RECEIVER_EBIRR", "niguse derse Dameta")
 	CBEMobileAPIBase            = getenvDefault("CBE_MOBILE_API_BASE", "https://mb.cbe.com.et")
 	CBEMobileAppID              = getenvDefault("CBE_MOBILE_APP_ID", "d1292e42-7400-49de-a2d3-9731caa4c819")
 	CBEMobileAppVersion         = getenvDefault("CBE_MOBILE_APP_VERSION", "0a01980b-9859-1369-8198-59f403820000")
@@ -4660,70 +4660,70 @@ func main() {
 			if r != nil { // telebirr/ebirr
 				invoice = strings.TrimSpace(r.InvoiceNo)
 				dateStr = normalizeReceiptDate(r.PaymentDate)
-				// After extracting dateStr, add this validation
-				if dateStr != "" {
-					isValid, err := isWithinLastDays(dateStr, 5)
-					if err != nil {
-						log.Printf("Date parsing error: %v", err)
-						bot.Send(tgbotapi.NewMessage(chatID, 
-							"❌ Could not verify the payment date. Please make sure the receipt includes a valid date."))
-						continue
-					}
+				// // After extracting dateStr, add this validation
+				// if dateStr != "" {
+				// 	isValid, err := isWithinLastDays(dateStr, 5)
+				// 	if err != nil {
+				// 		log.Printf("Date parsing error: %v", err)
+				// 		bot.Send(tgbotapi.NewMessage(chatID, 
+				// 			"❌ Could not verify the payment date. Please make sure the receipt includes a valid date."))
+				// 		continue
+				// 	}
 					
-					if !isValid {
-						msg := fmt.Sprintf(
-							"❌ <b>Invalid Payment Date</b>\n\n"+
-							"The payment date <b>%s</b> is older than 5 days.\n\n"+
-							"For security reasons, we only accept deposits made within the last 5 days.\n"+
-							"Please make a new payment and send the receipt within 5 days.",
-							escapeHTML(dateStr),
-						)
-						m := tgbotapi.NewMessage(chatID, msg)
-						m.ParseMode = "HTML"
-						bot.Send(m)
+				// 	if !isValid {
+				// 		msg := fmt.Sprintf(
+				// 			"❌ <b>Invalid Payment Date</b>\n\n"+
+				// 			"The payment date <b>%s</b> is older than 5 days.\n\n"+
+				// 			"For security reasons, we only accept deposits made within the last 5 days.\n"+
+				// 			"Please make a new payment and send the receipt within 5 days.",
+				// 			escapeHTML(dateStr),
+				// 		)
+				// 		m := tgbotapi.NewMessage(chatID, msg)
+				// 		m.ParseMode = "HTML"
+				// 		bot.Send(m)
 						
-						if NotifyChatID != 0 {
-							adminMsg := fmt.Sprintf("⚠️ Rejected old payment (user: %d)\nDate: %s", userID, dateStr)
-							bot.Send(tgbotapi.NewMessage(NotifyChatID, adminMsg))
-						}
-						continue
-					}
-				}
+				// 		if NotifyChatID != 0 {
+				// 			adminMsg := fmt.Sprintf("⚠️ Rejected old payment (user: %d)\nDate: %s", userID, dateStr)
+				// 			bot.Send(tgbotapi.NewMessage(NotifyChatID, adminMsg))
+				// 		}
+				// 		continue
+				// 	}
+				// }
 				amount = r.SettledAmount
 				sender = firstNonEmpty(r.PayerName, "")
 				receiver = firstNonEmpty(r.CreditedPartyName, "")
 			} else if cbeRec != nil { // cbe
 				invoice = strings.TrimSpace(cbeRec.TxID)
 				dateStr = normalizeReceiptDate(cbeRec.PaymentDate)
-				// After extracting dateStr, add this validation
-				if dateStr != "" {
-					isValid, err := isWithinLastDays(dateStr, 5)
-					if err != nil {
-						log.Printf("Date parsing error: %v", err)
-						bot.Send(tgbotapi.NewMessage(chatID, 
-							"❌ Could not verify the payment date. Please make sure the receipt includes a valid date."))
-						continue
-					}
+				// // After extracting dateStr, add this validation
+				// if dateStr != "" {
+				// 	isValid, err := isWithinLastDays(dateStr, 5)
+				// 	if err != nil {
+				// 		log.Printf("Date parsing error: %v", err)
+				// 		bot.Send(tgbotapi.NewMessage(chatID, 
+				// 			"❌ Could not verify the payment date. Please make sure the receipt includes a valid date."))
+				// 		continue
+				// 	}
 					
-					if !isValid {
-						msg := fmt.Sprintf(
-							"❌ <b>Invalid Payment Date</b>\n\n"+
-							"The payment date <b>%s</b> is older than 5 days.\n\n"+
-							"For security reasons, we only accept deposits made within the last 5 days.\n"+
-							"Please make a new payment and send the receipt within 5 days.",
-							escapeHTML(dateStr),
-						)
-						m := tgbotapi.NewMessage(chatID, msg)
-						m.ParseMode = "HTML"
-						bot.Send(m)
+				// 	if !isValid {
+				// 		msg := fmt.Sprintf(
+				// 			"❌ <b>Invalid Payment Date</b>\n\n"+
+				// 			"The payment date <b>%s</b> is older than 5 days.\n\n"+
+				// 			"For security reasons, we only accept deposits made within the last 5 days.\n"+
+				// 			"Please make a new payment and send the receipt within 5 days.",
+				// 			escapeHTML(dateStr),
+				// 		)
+				// 		m := tgbotapi.NewMessage(chatID, msg)
+				// 		m.ParseMode = "HTML"
+				// 		bot.Send(m)
 						
-						if NotifyChatID != 0 {
-							adminMsg := fmt.Sprintf("⚠️ Rejected old payment (user: %d)\nDate: %s", userID, dateStr)
-							bot.Send(tgbotapi.NewMessage(NotifyChatID, adminMsg))
-						}
-						continue
-					}
-				}
+				// 		if NotifyChatID != 0 {
+				// 			adminMsg := fmt.Sprintf("⚠️ Rejected old payment (user: %d)\nDate: %s", userID, dateStr)
+				// 			bot.Send(tgbotapi.NewMessage(NotifyChatID, adminMsg))
+				// 		}
+				// 		continue
+				// 	}
+				// }
 				amount = cbeRec.TransferredAmount
 				sender = firstNonEmpty(cbeRec.PayerName, "")
 				receiver = firstNonEmpty(cbeRec.ReceiverName, "")
