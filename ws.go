@@ -2604,11 +2604,26 @@ func wsRoomHandler(c *gin.Context) {
 	rc.readPump()
 
 	rm.unregisterConn(rc)
-	rm.removePlayer(tid)
-	// Queue disconnect cleanup asynchronously - not blocking
-	queueAsyncWrite(func() {
-		_ = upsertRoomPlayerWithTwo(rm.RoomID, tid, nil, nil)
-	})
+
+	// Preserve seat on disconnect/refresh when any of these hold:
+	//   - round is in progress (playing / claimed)
+	//   - countdown is running (about_to_start)
+	//   - user has paid for the upcoming round in pending
+	// In those cases the stake bought their seat and a reconnect (same tid)
+	// must still see their board, called numbers, and be able to claim.
+	rm.mu.Lock()
+	keepSeat := rm.Status == "playing" || rm.Status == "claimed" ||
+		rm.Status == "about_to_start" ||
+		(rm.Status == "pending" && rm.debited[tid] > 0)
+	rm.mu.Unlock()
+
+	if !keepSeat {
+		rm.removePlayer(tid)
+		// Queue disconnect cleanup asynchronously - not blocking
+		queueAsyncWrite(func() {
+			_ = upsertRoomPlayerWithTwo(rm.RoomID, tid, nil, nil)
+		})
+	}
 
 	saveRoomStateToDB(rm)
 	globalRoomsHub.broadcastRooms()
