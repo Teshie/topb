@@ -82,10 +82,18 @@ type botConfig struct {
 	JoinJitter time.Duration
 
 	// Selection staggering and human-ish jitter
-	SlotSpacing    time.Duration
+	SlotSpacing    time.Duration // legacy fallback (used if desired count is unknown)
 	SelectDelayMin time.Duration
 	SelectDelayMax time.Duration
 	SmallJitterMax time.Duration
+
+	// Adaptive selection window: all on-duty bots for a room MUST finish
+	// their set_board attempts inside this window, regardless of bot count.
+	// Spacing is computed as clamp(SelectionWindow / activeBots, MinSpacing, MaxSpacing).
+	// Must be strictly less than the server countdown (30s in ws.go) with a safety margin.
+	SelectionWindow time.Duration
+	MinSpacing      time.Duration
+	MaxSpacing      time.Duration
 
 	// Quick retry window after a selection conflict
 	RetryWithinAfterSelect time.Duration
@@ -114,10 +122,16 @@ func newBotConfig() botConfig {
 
 		JoinJitter: 1500 * time.Millisecond, // [750ms .. 1500ms] initial join jitter
 
-		SlotSpacing:    180 * time.Millisecond,  // Reduced from 250ms - allows 150 bots in ~12 seconds
+		SlotSpacing:    180 * time.Millisecond,  // legacy fallback only
 		SelectDelayMin: 0,
 		SelectDelayMax: 0,
-		SmallJitterMax: 120 * time.Millisecond, // Reduced from 200ms
+		SmallJitterMax: 120 * time.Millisecond, // upper cap for per-slot jitter
+
+		// Adaptive window: complete ALL set_board attempts within 12s,
+		// leaving ~18s safety margin inside the 30s server countdown.
+		SelectionWindow: 12 * time.Second,
+		MinSpacing:      25 * time.Millisecond,  // prevent ws flood when bot count is very high
+		MaxSpacing:      220 * time.Millisecond, // prevent huge spread when bot count is low
 
 		RetryWithinAfterSelect: 5 * time.Second, // Extended from 2s for more retry opportunities
 
@@ -320,6 +334,36 @@ func updateRoomScheduleOnState(roomID, status string) (base time.Time, newlySet 
 }
 
 // ---------------- Entrypoint ----------------
+
+// effectiveSlotSpacing returns the per-slot spacing that guarantees all on-duty
+// bots for `roomID` finish their selection attempts inside cfg.SelectionWindow.
+// It adapts to the current desired bot count so:
+//   - high bot count  -> smaller spacing (tight but bounded by MinSpacing)
+//   - low bot count   -> larger spacing (bounded by MaxSpacing)
+// This eliminates the tradeoff where fixed spacing bunches bots (small) or
+// pushes tail slots past the countdown (large).
+func effectiveSlotSpacing(cfg botConfig, roomID string, now time.Time) time.Duration {
+	active := desiredBotCount(roomID, now)
+	if active <= 1 {
+		// fallback to legacy constant when the schedule is unknown
+		if cfg.SlotSpacing > 0 {
+			return cfg.SlotSpacing
+		}
+		return cfg.MaxSpacing
+	}
+	win := cfg.SelectionWindow
+	if win <= 0 {
+		win = 12 * time.Second
+	}
+	sp := win / time.Duration(active)
+	if cfg.MinSpacing > 0 && sp < cfg.MinSpacing {
+		sp = cfg.MinSpacing
+	}
+	if cfg.MaxSpacing > 0 && sp > cfg.MaxSpacing {
+		sp = cfg.MaxSpacing
+	}
+	return sp
+}
 
 func startBots(ctx context.Context) {
 	// Always enabled (per your request)
@@ -705,9 +749,21 @@ func botSession(ctx context.Context, cfg botConfig, roomID string, tid int64, sl
 					if st.roundBase.IsZero() || base.After(st.roundBase.Add(1*time.Second)) || base.Before(st.roundBase.Add(-1*time.Second)) {
 						st.roundBase = base
 
-						slotTime := base.Add(time.Duration(slotIdx) * cfg.SlotSpacing)
-						if cfg.SmallJitterMax > 0 {
-							slotTime = slotTime.Add(randBetween(0, cfg.SmallJitterMax))
+						// Adaptive spacing: all on-duty bots finish inside
+						// cfg.SelectionWindow regardless of bot count. Spacing
+						// = clamp(SelectionWindow/activeBots, MinSpacing, MaxSpacing).
+						spacing := effectiveSlotSpacing(cfg, roomID, time.Now())
+						slotTime := base.Add(time.Duration(slotIdx) * spacing)
+
+						// Jitter scales with spacing (<= spacing/2) so bots never
+						// cross neighbouring slots and never bunch when spacing
+						// is small. Hard-capped by SmallJitterMax.
+						jitterCap := spacing / 2
+						if cfg.SmallJitterMax > 0 && jitterCap > cfg.SmallJitterMax {
+							jitterCap = cfg.SmallJitterMax
+						}
+						if jitterCap > 0 {
+							slotTime = slotTime.Add(randBetween(0, jitterCap))
 						}
 						if cfg.SelectDelayMax > 0 {
 							slotTime = slotTime.Add(randBetween(cfg.SelectDelayMin, cfg.SelectDelayMax))
