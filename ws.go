@@ -1992,6 +1992,17 @@ func (r *roomLive) resetForNextRoundLocked() {
 		r.claimTimer = nil
 	}
 	r.claimants = make(map[int64]claimant)
+
+	// Clear per-player board assignments in the DB so the next round
+	// starts from a truly fresh slate. Without this, stale board_number
+	// rows can: (a) resurrect phantom boards on server restart via the
+	// room_players loader, or (b) cause a stale reconnect in the
+	// Ready/pending boundary to re-claim (and re-debit) the previous
+	// round's board. Async to avoid holding r.mu across a DB write.
+	roomID := r.RoomID
+	queueAsyncWrite(func() {
+		_ = clearAllBoardsInDB(roomID)
+	})
 }
 
 /* ============================================================
