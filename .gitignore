@@ -39,3 +39,12 @@ yarn-debug.log*
 yarn-error.log*
 -e 
 
+-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
