@@ -91,6 +91,7 @@ type botConfig struct {
 	// their set_board attempts inside this window, regardless of bot count.
 	// Spacing is computed as clamp(SelectionWindow / activeBots, MinSpacing, MaxSpacing).
 	// Must be strictly less than the server countdown (30s in ws.go) with a safety margin.
+	// Default 20s → 10s safety margin.
 	SelectionWindow time.Duration
 	MinSpacing      time.Duration
 	MaxSpacing      time.Duration
@@ -127,9 +128,9 @@ func newBotConfig() botConfig {
 		SelectDelayMax: 0,
 		SmallJitterMax: 120 * time.Millisecond, // upper cap for per-slot jitter
 
-		// Adaptive window: complete ALL set_board attempts within 12s,
-		// leaving ~18s safety margin inside the 30s server countdown.
-		SelectionWindow: 12 * time.Second,
+		// Adaptive window: complete ALL set_board attempts within 20s,
+		// leaving ~10s safety margin inside the 30s server countdown.
+		SelectionWindow: 20 * time.Second,
 		MinSpacing:      25 * time.Millisecond,  // prevent ws flood when bot count is very high
 		MaxSpacing:      220 * time.Millisecond, // prevent huge spread when bot count is low
 
@@ -353,7 +354,7 @@ func effectiveSlotSpacing(cfg botConfig, roomID string, now time.Time) time.Dura
 	}
 	win := cfg.SelectionWindow
 	if win <= 0 {
-		win = 12 * time.Second
+		win = 20 * time.Second
 	}
 	sp := win / time.Duration(active)
 	if cfg.MinSpacing > 0 && sp < cfg.MinSpacing {
